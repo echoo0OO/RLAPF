@@ -1,7 +1,7 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-
+import cv2
 from env.env_utils import  poisson_disk_sampling
 from env.reward_shaping import reward_function_apf
 
@@ -37,7 +37,8 @@ class DroneNavigationEnv(gym.Env):
         self.action_con_dim = config.get("action_con_dim", 2)
         self.area_size = config.get("area_size", (1000.0, 1000.0))
         self.solo_SN_data = config.get("solo_SN_data", 2e7)
-        self.max_steps_per_episode = config.get("max_steps", 1000)
+        self.max_steps_per_episode = config.get("max_steps", 500)
+        self.local_view_size = config.get("local_view_size", 150.0)  # 局部视图为 150m x 150m
 
         # --- 1. 定义复杂的观测空间 (使用 spaces.Dict) ---
         self.observation_space = spaces.Dict({
@@ -73,7 +74,6 @@ class DroneNavigationEnv(gym.Env):
         self.noise_power = 1e-11  # W (-110dBm)
         self.snr_threshold = 10.0  # dB
         # 状态变量
-        # --- 状态变量 ---
         # 这些变量会在reset时被正确初始化
         self.drone_position = None
         self.sensor_true_positions = None
@@ -83,11 +83,11 @@ class DroneNavigationEnv(gym.Env):
         self.sensor_states = None
         self.reward_map = None
         self.current_step = 0
-
-        # 为地图生成预先计算网格坐标
-        self.x_map_coords = np.linspace(0, self.area_size[0], self.img_w)
-        self.y_map_coords = np.linspace(0, self.area_size[1], self.img_h)
-        self.X_mesh, self.Y_mesh = np.meshgrid(self.x_map_coords, self.y_map_coords)
+        # --- 新增: 追踪定位稳定性的状态变量 ---
+        self.radius_stable_steps = 0  # 连续多少步半径变化很小
+        self.stable_threshold = 3  # 需要连续多少步才算稳定
+        # 存储上一步的半径，用于比较变化
+        self.previous_radii = None
 
         # 记录和可视化
         self.trajectory = []
@@ -129,15 +129,27 @@ class DroneNavigationEnv(gym.Env):
         # 组合成多通道地图
         map_obs = np.stack([self.reward_map, drone_pos_map], axis=0)
 
-        # 获取动作掩码，例如，如果某个传感器数据已满，则不可选
-        action_mask = np.ones((self.action_dis_dim, self.action_dis_len), dtype=np.int8)
-        # ... 更新掩码的逻辑 ...
+        # --- 动态生成动作掩码 ---
+        # 动作0: 通信, 动作1: 定位
+        action_mask = np.zeros((self.action_dis_dim, self.action_dis_len), dtype=np.int8)
 
+        # 判断定位是否稳定
+        if self.radius_stable_steps < self.stable_threshold:
+            # 定位不稳定阶段：强制或优先进行定位
+            # 掩码为 [0, 1]，意味着只有动作1（定位）是可用的
+            action_mask[0, 1] = 1
+        else:
+            # 定位稳定阶段：优先进行通信
+            # 掩码为 [1, 1]，意味着两个动作都可用，让智能体自己决定
+            # 也可以设为 [1, 0] 来强制通信，但允许两个动作通常更灵活
+            action_mask[0, 0] = 1
+            action_mask[0, 1] = 1
         return {
             "map": map_obs,
             "sensors": self.sensor_states,
             "action_mask": action_mask
         }
+
 
     def _get_info(self):
         """辅助函数：返回一些用于调试的额外信息。"""
@@ -153,6 +165,8 @@ class DroneNavigationEnv(gym.Env):
         super().reset(seed=seed)
 
         # ... 在这里实现重置环境的逻辑 ...
+        self.radius_stable_steps = 0
+        self.previous_radii = np.full(self.num_sensors, 100.0)  # 初始半径都是100m
         # 1. 重置内部计数器
         self.current_step = 0
 
@@ -187,33 +201,8 @@ class DroneNavigationEnv(gym.Env):
             self.sensor_data_amounts.reshape(-1, 1)  # reshape为列向量
         ], axis=1).astype(np.float32)
 
-        # 6. 初始化奖励地图 (源自 show5_3APF.py)
-        # a. 为每个传感器生成一个APF奖励层和一个全1的GDOP遮罩层
-        all_sensor_rewards = []
-        for i in range(self.num_sensors):
-            xc, yc = self.sensor_estimated_positions[i]
-
-            # 计算APF奖励表面
-            # R_max和r_threshold可以作为配置传入或在这里定义
-            reward_layer = reward_function_apf(
-                self.X_mesh, self.Y_mesh, R_max=100.0, r_threshold=100.0, xc=xc, yc=yc
-            )
-
-            # 初始GDOP遮罩为全1
-            gdop_mask_layer = np.ones((self.img_h, self.img_w), dtype=np.float32)
-
-            # 应用遮罩
-            masked_reward = reward_layer * gdop_mask_layer
-            all_sensor_rewards.append(masked_reward)
-
-        # b. 将所有传感器的奖励层融合成一个单一的奖励地图
-        # 使用np.maximum，地图上每个点的值等于它能从所有传感器中获得的最大奖励
-        if all_sensor_rewards:
-            self.reward_map = np.maximum.reduce(all_sensor_rewards).astype(np.float32)
-        else:  # 以防万一没有传感器
-            self.reward_map = np.zeros((self.img_h, self.img_w), dtype=np.float32)
-
-        # 7. 获取最终的观测和信息
+        # 6. reset不需要计算全局奖励图。
+        #    它只需要调用一次_get_obs()来生成初始观测即可。
         observation = self._get_obs()
         info = self._get_info()
 
