@@ -33,6 +33,11 @@ def train():
         "max_steps_per_episode": 500,
         "solo_SN_data": 2e7,
 
+        # !! 关键修正：添加缺失的动作维度参数 !!
+        "action_dis_dim": 1,
+        "action_dis_len": 2,
+        "action_con_dim": 2,
+
         # 算法网络结构参数
         "map_feature_dim": 128,
         "mid_dim": [256, 256],
@@ -52,13 +57,13 @@ def train():
         "buffer_size": 2048,
         "max_norm": 0.5,
         "coeff_entropy": 0.01,
+        "lr_std": 3e-4,
+        "if_use_active_selection": False,
+        "v_iters": 80,
 
         # 其他
         "random_seed": 42,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
-        "if_use_active_selection": False,
-        "lr_std": 3e-4,
-        # v_iters 在您的PPO类中没有被使用，暂时移除
     }
 
     # --- 日志、绘图和保存的超参数 ---

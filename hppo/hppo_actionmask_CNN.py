@@ -296,10 +296,26 @@ class PPO_Hybrid(PPO_Abstract, ABC):
                  gamma, lam, epochs_update, v_iters, eps_clip, max_norm, coeff_entropy, random_seed, device,
                  lr_std, init_log_std, if_use_active_selection):
         # PPO_Abstract的 __init__ 可能需要微调，或者直接在这里处理
-        # 为简化，我们直接调用，但注意里面的state_dim可能不再准确反映网络结构
-        super().__init__(state_dim, action_dis_dim, action_dis_len, action_con_dim, mid_dim, lr_actor, lr_critic,
-                         lr_decay_rate, buffer_size, target_kl_dis, target_kl_con,
-                         gamma, lam, epochs_update, v_iters, eps_clip, max_norm, coeff_entropy, random_seed, device)
+        self.target_kl_dis = target_kl_dis
+        self.target_kl_con = target_kl_con
+        self.gamma = gamma
+        self.lam = lam
+        self.epochs_update = epochs_update
+        self.v_iters = v_iters
+        self.eps_clip = eps_clip
+        self.max_norm = max_norm
+        self.coeff_entropy = coeff_entropy
+        self.random_seed = random_seed
+        self.set_random_seeds()  # set_random_seeds是PPO_Abstract的方法，可以直接调用
+        self.device = device
+        self.action_dis_dim = action_dis_dim
+        self.action_dis_len = action_dis_len
+        self.action_con_dim = action_con_dim
+
+        # Buffer的初始化也移到这里
+        self.buffer = PPOBuffer(state_dim, action_dis_dim, action_dis_len, action_con_dim, buffer_size, gamma, lam,
+                                device)
+        self.loss_func = nn.SmoothL1Loss(reduction='mean')
 
         # !! 保存维度信息，用于数据还原 !!
         self.MAP_CHANNELS = map_channels
@@ -326,24 +342,25 @@ class PPO_Hybrid(PPO_Abstract, ABC):
         ).to(device)
         self.agent_old.load_state_dict(self.agent.state_dict())
 
-        # --- 修改优化器，使其指向新的网络头部 ---
+        # --- 修改优化器以指向新的网络头部 ---
         self.optimizer_critic = torch.optim.Adam(self.agent.critic_head.parameters(), lr=lr_critic)
 
-        # 为两个actor头创建独立的优化器
-        self.optimizer_actor_con = torch.optim.Adam(
-            self.agent.actor_con_head.parameters(), lr=lr_actor * 1.5
-        )
+        self.optimizer_actor_con = torch.optim.Adam([
+            {'params': self.agent.actor_con_head.parameters(), 'lr': lr_actor * 1.5},
+            {'params': self.agent.log_std, 'lr': lr_std},
+        ])
+
         self.optimizer_actor_dis = torch.optim.Adam(
             self.agent.actor_dis_head.parameters(), lr=lr_actor
         )
 
+        # --- lr_scheduler 也需要重新绑定到新的优化器 ---
         self.lr_scheduler_critic = torch.optim.lr_scheduler.ExponentialLR(optimizer=self.optimizer_critic,
                                                                           gamma=lr_decay_rate)
         self.lr_scheduler_actor_con = torch.optim.lr_scheduler.ExponentialLR(optimizer=self.optimizer_actor_con,
                                                                              gamma=lr_decay_rate)
         self.lr_scheduler_actor_dis = torch.optim.lr_scheduler.ExponentialLR(optimizer=self.optimizer_actor_dis,
                                                                              gamma=lr_decay_rate)
-
     def _prepare_inputs(self, obs_flat):
         """
         辅助函数，将从buffer中取出的扁平化obs向量还原为结构化输入。
