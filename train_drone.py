@@ -113,8 +113,8 @@ def train():
 
             # b. 智能体选择动作
             action_mask_dict = {
-                "discrete_mask": obs_dict["action_mask"],
-                "continuous_mask": np.ones(config["action_con_dim"])
+                "discrete_mask": obs_dict["action_mask_discrete"],
+                "continuous_mask": obs_dict["action_mask_continuous"]
             }
             value, (action_dis, action_con), (logp_dis, logp_con) = agent.select_action(flat_obs, action_mask_dict)
 
@@ -128,7 +128,7 @@ def train():
             # 注意：您的PPOBuffer实现似乎需要logp是单个numpy值或特定形状的数组，这里做了相应处理
             agent.buffer.store_hybrid(
                 flat_obs,
-                {"discrete_mask": obs_dict["action_mask"]},
+                {"discrete_mask": obs_dict["action_mask_discrete"]},
                 np.array([action_dis]),  # 确保是数组
                 action_con,
                 reward,

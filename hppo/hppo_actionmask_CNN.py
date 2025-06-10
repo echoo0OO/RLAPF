@@ -273,9 +273,63 @@ class ActorCritic_Hybrid_Attention(nn.Module):
 
 
 # (保留您原有的 PPO_Abstract, PPO_Discrete, PPO_Continuous)
-class PPO_Abstract:
-    # ... 您原有的实现 ...
-    pass
+class PPO_Abstract(ABC):  # 明确它是一个抽象基类
+    def __init__(self,
+                 # 这里只保留所有子类都共有的超参数
+                 gamma, lam, epochs_update, eps_clip, max_norm,
+                 coeff_entropy, random_seed, device
+                 ):
+        # 父类只负责存储通用参数
+        self.gamma = gamma
+        self.lam = lam
+        self.epochs_update = epochs_update
+        self.eps_clip = eps_clip
+        self.max_norm = max_norm
+        self.coeff_entropy = coeff_entropy
+        self.random_seed = random_seed
+        self.device = device
+
+        # agent, buffer, optimizers等都将在子类中定义
+        self.agent = None
+        self.agent_old = None
+        self.buffer = None
+        self.optimizer_actor = None
+        self.optimizer_critic = None
+        self.loss_func = nn.SmoothL1Loss(reduction='mean')
+
+        # 这个方法现在可以被正确继承和调用
+        self.set_random_seeds()
+
+    # --- 以下方法被所有子类继承，无需修改 ---
+    def select_action(self, state, action_mask):
+        raise NotImplementedError
+
+    def compute_loss_pi(self, data):
+        raise NotImplementedError
+
+    def compute_loss_v(self, data):
+        raise NotImplementedError
+
+    def update(self, batch_size):
+        raise NotImplementedError
+
+    def save(self, checkpoint_path):
+        torch.save(self.agent_old.state_dict(), checkpoint_path)
+
+    def load(self, checkpoint_path):
+        self.agent_old.load_state_dict(torch.load(checkpoint_path, map_location=lambda storage, loc: storage))
+        self.agent.load_state_dict(torch.load(checkpoint_path, map_location=lambda storage, loc: storage))
+
+    def set_random_seeds(self):
+        os.environ['PYTHONHASHSEED'] = str(self.random_seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.manual_seed(self.random_seed)
+        random.seed(self.random_seed)
+        np.random.seed(self.random_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.random_seed)
+            torch.cuda.manual_seed(self.random_seed)
 
 
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -296,34 +350,26 @@ class PPO_Hybrid(PPO_Abstract, ABC):
                  gamma, lam, epochs_update, v_iters, eps_clip, max_norm, coeff_entropy, random_seed, device,
                  lr_std, init_log_std, if_use_active_selection):
         # PPO_Abstract的 __init__ 可能需要微调，或者直接在这里处理
-        self.target_kl_dis = target_kl_dis
-        self.target_kl_con = target_kl_con
-        self.gamma = gamma
-        self.lam = lam
-        self.epochs_update = epochs_update
-        self.v_iters = v_iters
-        self.eps_clip = eps_clip
-        self.max_norm = max_norm
-        self.coeff_entropy = coeff_entropy
-        self.random_seed = random_seed
-        self.set_random_seeds()  # set_random_seeds是PPO_Abstract的方法，可以直接调用
-        self.device = device
-        self.action_dis_dim = action_dis_dim
-        self.action_dis_len = action_dis_len
-        self.action_con_dim = action_con_dim
-
-        # Buffer的初始化也移到这里
-        self.buffer = PPOBuffer(state_dim, action_dis_dim, action_dis_len, action_con_dim, buffer_size, gamma, lam,
-                                device)
-        self.loss_func = nn.SmoothL1Loss(reduction='mean')
-
-        # !! 保存维度信息，用于数据还原 !!
+        # --- 关键修改 1：正确调用父类初始化 ---
+        # 只传递父类需要的通用参数
+        super().__init__(gamma=gamma, lam=lam, epochs_update=epochs_update,
+                         eps_clip=eps_clip, max_norm=max_norm,
+                         coeff_entropy=coeff_entropy, random_seed=random_seed,
+                         device=device)
         self.MAP_CHANNELS = map_channels
-        self.IMG_H, self.IMG_W = img_h, img_w
+        self.IMG_H = img_h
+        self.IMG_W = img_w
         self.NUM_SENSORS = num_sensors
         self.SENSOR_DIM = sensor_dim
+        # --- 关键修改 2：子类负责自己的所有具体实现 ---
+        self.target_kl_dis = target_kl_dis
+        self.target_kl_con = target_kl_con
 
-        # --- 关键修改：实例化新的网络 ---
+        # 初始化Buffer
+        self.buffer = PPOBuffer(state_dim, action_dis_dim, action_dis_len, action_con_dim, buffer_size, gamma, lam,
+                                device)
+
+        # 初始化注意力网络Agent
         self.agent = ActorCritic_Hybrid_Attention(
             map_channels, img_h, img_w,
             sensor_dim,
@@ -342,25 +388,21 @@ class PPO_Hybrid(PPO_Abstract, ABC):
         ).to(device)
         self.agent_old.load_state_dict(self.agent.state_dict())
 
-        # --- 修改优化器以指向新的网络头部 ---
+        # 初始化优化器和学习率调度器
         self.optimizer_critic = torch.optim.Adam(self.agent.critic_head.parameters(), lr=lr_critic)
-
         self.optimizer_actor_con = torch.optim.Adam([
-            {'params': self.agent.actor_con_head.parameters(), 'lr': lr_actor * 1.5},
+            {'params': self.agent.actor_con_head.parameters(), 'lr': lr_actor},
             {'params': self.agent.log_std, 'lr': lr_std},
         ])
+        self.optimizer_actor_dis = torch.optim.Adam(self.agent.actor_dis_head.parameters(), lr=lr_actor)
 
-        self.optimizer_actor_dis = torch.optim.Adam(
-            self.agent.actor_dis_head.parameters(), lr=lr_actor
-        )
-
-        # --- lr_scheduler 也需要重新绑定到新的优化器 ---
         self.lr_scheduler_critic = torch.optim.lr_scheduler.ExponentialLR(optimizer=self.optimizer_critic,
                                                                           gamma=lr_decay_rate)
         self.lr_scheduler_actor_con = torch.optim.lr_scheduler.ExponentialLR(optimizer=self.optimizer_actor_con,
                                                                              gamma=lr_decay_rate)
         self.lr_scheduler_actor_dis = torch.optim.lr_scheduler.ExponentialLR(optimizer=self.optimizer_actor_dis,
                                                                              gamma=lr_decay_rate)
+
     def _prepare_inputs(self, obs_flat):
         """
         辅助函数，将从buffer中取出的扁平化obs向量还原为结构化输入。
@@ -390,12 +432,28 @@ class PPO_Hybrid(PPO_Abstract, ABC):
                 'continuous_mask': torch.FloatTensor(action_mask['continuous_mask']).to(self.device).unsqueeze(0)
             }
 
-            state_value, action_dis, action_con, log_prob_dis, log_prob_con = self.agent_old.act(map_input, sensor_data,
+            state_value, action_dis, action_con_raw, log_prob_dis, log_prob_con = self.agent_old.act(map_input, sensor_data,
                                                                                                  mask_dict_tensor)
 
+            # 1. 获取掩码边界 (numpy格式)
+            con_mask_bounds = action_mask['continuous_mask']
+
+            # 2. 将PyTorch Tensor转为Numpy，以便使用 np.clip
+            action_con_raw_np = action_con_raw.squeeze().cpu().numpy()
+
+            # 3. 裁剪动作到掩码定义的范围
+            # 注意：action_con_raw_np 是 [-1, 1] 范围的，mask 也是 [-1, 1] 范围的
+            action_con_clipped = np.clip(
+                action_con_raw_np,
+                con_mask_bounds[:, 0],  # low bounds
+                con_mask_bounds[:, 1]  # high bounds
+            )
+
+            # 返回裁剪后的连续动作
         return (state_value.squeeze().cpu().numpy(),
-                (action_dis.squeeze().cpu().numpy(), action_con.squeeze().cpu().numpy()),
+                (action_dis.squeeze().cpu().numpy(), action_con_clipped),  # <--- 返回裁剪后的动作
                 (log_prob_dis.squeeze().cpu().numpy(), log_prob_con.squeeze().cpu().numpy()))
+
 
     def compute_loss_pi(self, data):
         obs, action_mask_flat, act_dis, act_con, adv, _, logp_old_dis, logp_old_con = data

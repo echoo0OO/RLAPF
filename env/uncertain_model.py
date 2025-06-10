@@ -22,7 +22,7 @@ class UncertaintyModel:
         self.ranging_points = [[] for _ in range(self.num_sensors)]
         self.ranging_distances = [[] for _ in range(self.num_sensors)]
 
-    def __init__(self, num_sensors: int, confidence_level: float = 0.95):
+    def __init__(self, num_sensors: int, confidence_level: float = 0.99): # 置信度由0.95改到0.99
         """
         初始化不确定性模型
         

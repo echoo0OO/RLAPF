@@ -50,7 +50,7 @@ class DroneNavigationEnv(gym.Env):
             "map": spaces.Box(low=0, high=255, shape=(self.map_channels, self.img_h, self.img_w), dtype=np.float32), #局部地图150*150
             "sensors": spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_sensors, self.sensor_dim),
                                   dtype=np.float32),
-            "action_mask": spaces.Box(low=0, high=1, shape=(self.action_dis_dim, self.action_dis_len), dtype=np.int8)
+            # "action_mask": spaces.Box(low=0, high=1, shape=(self.action_dis_dim, self.action_dis_len), dtype=np.int8)
         })
 
         # --- 2. 定义混合动作空间 (使用 spaces.Dict) ---
@@ -63,7 +63,7 @@ class DroneNavigationEnv(gym.Env):
             'direction': {'low': -np.pi, 'high': np.pi},
             'speed': {'low': 0.0, 'high': 30.0}
         }
-
+        self.last_comm_success = True  # 初始假设通信是“成功”的，避免一开始就限速
         # --- 初始化环境状态 (示例) ---
         #环境参数
         self.area_size = (1000.0, 1000.0)
@@ -79,6 +79,7 @@ class DroneNavigationEnv(gym.Env):
         self.transmit_power = 0.1  # W
         self.noise_power = 1e-11  # W (-110dBm)
         self.snr_threshold = 10.0  # dB
+        self.delay_penalty_coefficient = 2e7 #时延系数=单个SN数据量
         # 定位参数
         # 在 __init__ 中实例化 GDOPCalculator
         self.gdop_calc = GDOPCalculator()
@@ -130,6 +131,23 @@ class DroneNavigationEnv(gym.Env):
         real_speed = low_speed + (norm_action[1] + 1.0) * 0.5 * (high_speed - low_speed)
 
         return real_direction, real_speed
+
+    def _generate_local_view_grid(self):
+        """
+        辅助函数：为当前无人机位置生成局部视图的坐标网格。
+        """
+        half_view = self.local_view_size / 2.0
+        center_x, center_y = self.drone_position
+
+        min_x = center_x - half_view
+        max_x = center_x + half_view
+        min_y = center_y - half_view
+        max_y = center_y + half_view
+
+        local_x_coords = np.linspace(min_x, max_x, self.img_w)
+        local_y_coords = np.linspace(min_y, max_y, self.img_h)
+
+        return np.meshgrid(local_x_coords, local_y_coords)
 
     def _calculate_gdop_mask_for_sensor(self, sensor_id: int, local_X_mesh, local_Y_mesh) -> np.ndarray:
         """
@@ -246,25 +264,79 @@ class DroneNavigationEnv(gym.Env):
         # 3. !! 恢复：将两个通道堆叠起来 !!
         map_obs = np.stack([local_reward_map, local_drone_pos_map], axis=0)
 
-        # --- 动态生成动作掩码 ---
-        # 动作0: 通信, 动作1: 定位
-        action_mask = np.zeros((self.action_dis_dim, self.action_dis_len), dtype=np.int8)
+        # --- 动态生成离散动作掩码 ---
+        action_mask_dis = np.ones((self.action_dis_dim, self.action_dis_len), dtype=np.int8)
+        is_stable = self.radius_stable_steps >= self.stable_threshold
 
-        # 判断定位是否稳定
-        if self.radius_stable_steps < self.stable_threshold:
-            # 定位不稳定阶段：可以进行定位和通信
-            action_mask[0, 0] = 1
-            action_mask[0, 1] = 1
-        else:
-            # 定位稳定阶段：优先进行通信
-            # 掩码为 [1, 1]，意味着两个动作都可用，让智能体自己决定
-            # 设为 [1, 0] 来强制通信
-            action_mask[0, 0] = 1
-            action_mask[0, 1] = 0
+        if is_stable:
+            # 定位稳定阶段：优先进行通信, 强制选择动作0 (通信)
+            action_mask_dis[0, 0] = 1  # 通信可用
+            action_mask_dis[0, 1] = 0  # 定位不可用 (强制通信)
+
+        # --- 动态生成连续动作掩码 ---
+        # 默认情况下，所有连续动作都可用，范围是 [-1, 1]
+        action_mask_con = np.array([[-1.0, 1.0], [-1.0, 1.0]], dtype=np.float32)
+
+        # 仅当定位稳定且需要优先通信时，才施加方向约束
+        if is_stable:
+            # a. 确定通信目标 (与 _execute_communication 逻辑一致)
+            eligible_sensors_mask = self.sensor_data_amounts > 0
+            horizontal_dist_to_est_center = np.linalg.norm(
+                self.drone_position - self.sensor_estimated_positions, axis=1
+            )
+            max_horizontal_dist = horizontal_dist_to_est_center + self.sensor_estimated_radii
+            max_dist_3d_all = np.sqrt(max_horizontal_dist ** 2 + self.drone_height ** 2)
+            # 将不合格的传感器的距离设置为无穷大，使其永远不会被选中
+            distances_to_consider = np.where(eligible_sensors_mask, max_dist_3d_all, np.inf)
+            # 选择合格者中距离最近的传感器
+            target_sensor_idx = np.argmin(distances_to_consider)
+
+            # b. 计算指向目标传感器的方向 (角度)
+            target_pos = self.sensor_estimated_positions[target_sensor_idx]
+            direction_vector = target_pos - self.drone_position
+
+            # 使用 arctan2 计算从-pi到pi的角度
+            target_direction_rad = np.arctan2(direction_vector[1], direction_vector[0])
+
+            # c. 定义一个可接受的角度范围 (例如，目标方向 ± 15度)
+            angle_tolerance_rad = np.deg2rad(15)
+            min_angle_rad = target_direction_rad - angle_tolerance_rad
+            max_angle_rad = target_direction_rad + angle_tolerance_rad
+
+            # d. 将真实角度范围 [-pi, pi] 映射到归一化范围 [-1, 1]
+            # 归一化函数: norm_val = (real_val - low) / (high - low) * 2 - 1
+            low_dir_real = self.real_action_bounds['direction']['low']  # -pi
+            high_dir_real = self.real_action_bounds['direction']['high']  # +pi
+
+            norm_min_angle = (min_angle_rad - low_dir_real) / (high_dir_real - low_dir_real) * 2 - 1
+            norm_max_angle = (max_angle_rad - low_dir_real) / (high_dir_real - low_dir_real) * 2 - 1
+
+            # 处理角度环绕问题 (例如，目标是-175度，范围可能跨越-180/180度)
+            # 简单处理：如果最小归一化值大于最大值，说明跨越了边界，暂时不加约束
+            if norm_min_angle < norm_max_angle:
+                action_mask_con[0, :] = [norm_min_angle, norm_max_angle]
+
+            # e. (可选) 也可以对速度施加约束，例如，强制高速飞行
+            # --- 新增规则2：如果上一步通信失败，约束速度 ---
+            if not self.last_comm_success:
+                # a. 定义真实速度的高速范围 [20, 30] m/s
+                high_speed_min_real = 20.0
+                high_speed_max_real = 30.0
+                # b. 获取速度的真实边界 [0, 30] m/s
+                low_speed_real = self.real_action_bounds['speed']['low']
+                high_speed_real = self.real_action_bounds['speed']['high']
+                # c. 将真实的高速范围映射到归一化范围 [-1, 1]
+                # 归一化函数: norm_val = (real_val - low) / (high - low) * 2 - 1
+                norm_min_speed = (high_speed_min_real - low_speed_real) / (high_speed_real - low_speed_real) * 2 - 1
+                norm_max_speed = (high_speed_max_real - low_speed_real) / (high_speed_real - low_speed_real) * 2 - 1
+                # d. 应用速度约束
+                action_mask_con[1, :] = [norm_min_speed, norm_max_speed]
+                print(f"上一步通信失败，应用速度约束: [{norm_min_speed:.2f}, {norm_max_speed:.2f}]")
         return {
             "map": map_obs,
             "sensors": self.sensor_states,
-            "action_mask": action_mask
+            "action_mask_discrete": action_mask_dis,
+            "action_mask_continuous": action_mask_con
         }
 
 
@@ -290,6 +362,8 @@ class DroneNavigationEnv(gym.Env):
         # ... 在这里实现重置环境的逻辑 ...
         self.radius_stable_steps = 0
         self.previous_radii = np.full(self.num_sensors, 100.0)  # 初始半径都是100m
+        # --- 重置通信状态 ---
+        self.last_comm_success = True
         # 1. 重置内部计数器
         self.current_step = 0
 
@@ -342,6 +416,14 @@ class DroneNavigationEnv(gym.Env):
         """
         执行与单个传感器的通信逻辑。
         """
+        # 1. 找到所有数据量大于零的合格传感器
+        eligible_sensors_mask = self.sensor_data_amounts > 0
+        # 如果没有合格的传感器（所有数据都采集完了），则直接返回
+        if not np.any(eligible_sensors_mask):
+            print("所有传感器数据均已采集完毕，跳过通信。")
+            # 保持上一步通信状态为成功，避免不必要的限速
+            self.last_comm_success = True
+            return
         # 1. 计算到每个传感器的“最大可能3D距离”用于目标选择
         # a. 无人机到每个传感器估计中心的水平距离
         horizontal_dist_to_est_center = np.linalg.norm(
@@ -353,8 +435,11 @@ class DroneNavigationEnv(gym.Env):
         # c. 使用勾股定理计算最大可能3D距离
         max_dist_3d = np.sqrt(max_horizontal_dist ** 2 + self.drone_height ** 2)
 
-        # 2. 选择最大可能距离最近的传感器作为通信目标
-        target_sensor_idx = np.argmin(max_dist_3d)
+        # 3. 在选择目标时，只考虑合格的传感器
+        # 将不合格的传感器的距离设置为无穷大，使其永远不会被选中
+        distances_to_consider = np.where(eligible_sensors_mask, max_dist_3d, np.inf)
+        # 选择合格者中距离最近的传感器
+        target_sensor_idx = np.argmin(distances_to_consider)
 
         # 3. 计算与该目标传感器的“真实3D距离”
         true_sensor_pos = self.sensor_true_positions[target_sensor_idx]
@@ -362,11 +447,12 @@ class DroneNavigationEnv(gym.Env):
         true_dist_3d = np.sqrt(true_horizontal_dist ** 2 + self.drone_height ** 2)
 
         # 4. 根据最大距离预测信道增益和信噪比 (SNR)
+
         # 将参考损耗从dB转换为线性尺度
         ref_gain_linear = 10 ** (self.reference_loss / 10)
 
         # 计算路径损耗因子
-        path_loss_factor_max = ref_gain_linear * (self.reference_distance / max_dist_3d) ** self.path_loss_exponent
+        path_loss_factor_max = ref_gain_linear * (self.reference_distance / max_dist_3d[target_sensor_idx]) ** self.path_loss_exponent
 
         # 计算接收功率
         received_power_est = self.transmit_power * path_loss_factor_max
@@ -379,10 +465,12 @@ class DroneNavigationEnv(gym.Env):
 
         # 5. 判断通信是否成功并计算传输的数据量
         transmitted_data = 0.0
+        snr_linear = 0.0
         if snr_linear_est >= self.snr_threshold:
+            self.last_comm_success = True
             # 通信成功，使用香农公式计算吞吐量 (bps)
             # 计算路径损耗因子
-            path_loss_factor = ref_gain_linear * (self.reference_distance / max_dist_3d) ** self.path_loss_exponent
+            path_loss_factor = ref_gain_linear * (self.reference_distance / true_dist_3d) ** self.path_loss_exponent
             # 计算接收功率
             received_power = self.transmit_power * path_loss_factor
             # 计算线性信噪比
@@ -391,9 +479,10 @@ class DroneNavigationEnv(gym.Env):
             # 在一个时隙内传输的数据量
             transmitted_data = throughput_bps * self.time_slot
             print(
-                f"与传感器 {target_sensor_idx} 通信成功。SNR: {snr_linear:.2f} dB, 传输数据: {transmitted_data / 1e6:.2f} Mbits")
+                f"与传感器 {target_sensor_idx} 通信成功。SNR: {snr_linear:.2f} , 传输数据: {transmitted_data / 1e6:.2f} Mbits")
         else:
-            print(f"与传感器 {target_sensor_idx} 通信失败。SNR: {snr_linear_est:.2f} dB (低于阈值 {self.snr_threshold_db} dB)")
+            self.last_comm_success = False
+            print(f"与传感器 {target_sensor_idx} 通信失败。SNR: {snr_linear_est:.2f}  (低于阈值 {self.snr_threshold} )")
         # 6. 更新传感器的剩余数据量
         current_data = self.sensor_data_amounts[target_sensor_idx]
         self.sensor_data_amounts[target_sensor_idx] = max(0, current_data - transmitted_data)
@@ -414,6 +503,8 @@ class DroneNavigationEnv(gym.Env):
         执行对所有传感器的单次测距，并根据条件更新不确定性模型。
         该版本明确使用2D水平距离进行所有计算。
         """
+        # 执行定位时，认为通信状态是“好的” !!
+        self.last_comm_success = True
         # 1. 计算到所有传感器的真实水平距离 (2D)
         true_horizontal_dist = np.linalg.norm(self.drone_position - self.sensor_true_positions, axis=1)
 
@@ -498,7 +589,7 @@ class DroneNavigationEnv(gym.Env):
         )
         # d. 记录轨迹点，用于后续的可视化
         if self.current_step % self.trajectory_save_freq == 0:
-            self.trajectory_points.append(self.drone_position.copy())
+            self.trajectory.append(self.drone_position.copy())
 
         if discrete_action == 0:
             # 执行通信逻辑...
