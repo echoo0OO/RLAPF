@@ -3,7 +3,12 @@ from gymnasium import spaces
 import numpy as np
 import cv2
 from env.env_utils import  poisson_disk_sampling
-from env.reward_shaping import reward_function_apf
+from env.reward_shaping import (
+    reward_function_apf,
+    GDOPCalculator,
+    calculate_gdop_heatmap_for_sensor,
+    create_gdop_mask_from_heatmap
+)
 from env.uncertain_model import UncertaintyModel
 
 # 这是一个完整的、可运行的环境模板
@@ -75,8 +80,11 @@ class DroneNavigationEnv(gym.Env):
         self.noise_power = 1e-11  # W (-110dBm)
         self.snr_threshold = 10.0  # dB
         # 定位参数
+        # 在 __init__ 中实例化 GDOPCalculator
+        self.gdop_calc = GDOPCalculator()
         self.g0 = config.get("g0", 1.125e-5) # 测量噪声方差系数
         self.uncertainty_model = UncertaintyModel(num_sensors=self.num_sensors)
+        self.R_max_base = 100.0
         # 用于触发定位模型更新的计数器
         self.ranging_update_interval = 10
         self.ranging_point_counter = 0
@@ -123,19 +131,120 @@ class DroneNavigationEnv(gym.Env):
 
         return real_direction, real_speed
 
+    def _calculate_gdop_mask_for_sensor(self, sensor_id: int, local_X_mesh, local_Y_mesh) -> np.ndarray:
+        """
+        为单个传感器计算其在当前局部视图上的GDOP遮罩。
+        """
+        # a. 从不确定性模型中获取所有历史测距点
+        all_points_history = self.uncertainty_model.ranging_points
+        all_points_flat = [pos for sensor_history in all_points_history for pos in sensor_history]
+
+        # b. 挑选距离当前传感器估计位置最近的10个点
+        sensor_est_pos_2d = self.sensor_estimated_positions[sensor_id]
+
+        if not all_points_flat:
+            # 如果没有任何历史测量点，返回一个表示“任何地方都好”的中性遮罩
+            return np.ones((self.img_h, self.img_w), dtype=np.float32)
+
+        all_points_array_2d = np.array(all_points_flat)
+        distances = np.linalg.norm(all_points_array_2d - sensor_est_pos_2d, axis=1)
+
+        num_to_select = min(10, len(all_points_array_2d))
+        closest_points_indices = np.argsort(distances)[:num_to_select]
+
+        # 将选中的2D测距点转换为3D（加上无人机高度）
+        measurement_points_3d = [
+            np.append(all_points_array_2d[i], self.drone_height) for i in closest_points_indices
+        ]
+
+        # 要定位的目标传感器也转换为3D（高度为0）
+        sensor_to_locate_3d = np.append(sensor_est_pos_2d, 0.0)
+
+        # c. 调用工具函数计算GDOP热力图
+        # 注意：这一步计算量非常大！
+        gdop_heatmap = calculate_gdop_heatmap_for_sensor(
+            local_X_mesh, local_Y_mesh,
+            measurement_points_3d,
+            sensor_to_locate_3d,
+            self.gdop_calc,
+            self.g0
+        )
+
+        # d. 调用工具函数将热力图转换为遮罩
+        gdop_mask = create_gdop_mask_from_heatmap(gdop_heatmap, cap_value=20.0)
+
+        return gdop_mask
+
+    def _compute_current_local_reward_map(self):
+        """
+        【新增】
+        根据当前状态（无人机位置、传感器状态），计算并返回当前的局部奖励地图。
+        这个函数是当前步骤中所有奖励地图计算的唯一来源。
+        """
+        # a. 为当前局部视图生成坐标网格
+        local_X_mesh, local_Y_mesh = self._generate_local_view_grid()
+
+        # b. 为每个传感器计算其贡献的奖励层
+        map_reward_layers = []
+        for i in range(self.num_sensors):
+            # 如果传感器数据已采完，则其吸引力（R_max）为0
+            current_R_max = self.R_max_base if self.sensor_data_amounts[i] > 0 else 0.0
+
+            # 计算APF奖励层
+            apf_layer = reward_function_apf(
+                local_X_mesh, local_Y_mesh,
+                R_max=current_R_max,
+                r_threshold=self.sensor_estimated_radii[i],
+                xc=self.sensor_estimated_positions[i][0],
+                yc=self.sensor_estimated_positions[i][1]
+            )
+
+            # 计算GDOP遮罩层
+            gdop_mask_layer = self._calculate_gdop_mask_for_sensor(i, local_X_mesh, local_Y_mesh)
+
+            # 应用遮罩并添加到列表中
+            map_reward_layers.append(apf_layer * gdop_mask_layer)
+
+        # c. 融合所有层，得到最终的局部奖励地图
+        if not map_reward_layers:  # 如果列表为空
+            return np.zeros((self.img_h, self.img_w), dtype=np.float32)
+
+        final_local_reward_map = np.maximum.reduce(map_reward_layers)
+        return final_local_reward_map
+
+    def _calculate_reward(self, current_reward_map):
+        """
+        【修改】
+        计算当前时间步的总奖励。它现在接收一个预先计算好的奖励地图作为参数。
+        """
+        # --- 1. 获取基于地图的奖励 ---
+        # 无人机在局部视图中永远在中心
+        center_h, center_w = self.img_h // 2, self.img_w // 2
+        map_based_reward = current_reward_map[center_h, center_w]
+
+        # --- 2. 计算时延惩罚 ---
+        data_collected = self.solo_SN_data - self.sensor_data_amounts
+        total_data_collected = np.sum(data_collected)
+        delay_penalty = - (total_data_collected / self.delay_penalty_coefficient)
+
+        # --- 3. 计算总奖励 ---
+        total_reward = map_based_reward + delay_penalty
+
+        return total_reward
+
     def _get_obs(self):
         """辅助函数：根据当前环境状态生成一个符合观测空间的字典。"""
-        # ... 在这里实现生成观测字典的逻辑 ...
-        # 例如，根据self.drone_position更新位置地图
-        drone_pos_map = np.zeros((self.img_h, self.img_w), dtype=np.float32)
-        if self.drone_position is not None:
-            # 将无人机位置(归一化到图像坐标)在地图上标记为1
-            pos_x = int(self.drone_position[0] * self.img_w)
-            pos_y = int(self.drone_position[1] * self.img_h)
-            drone_pos_map[pos_y, pos_x] = 1
+        # 1. 动态计算局部奖励地图
+        local_reward_map = self._compute_current_local_reward_map()
 
-        # 组合成多通道地图
-        map_obs = np.stack([self.reward_map, drone_pos_map], axis=0)
+        # 2. 创建无人机位置图
+        # 在局部视图中，无人机永远在中心
+        local_drone_pos_map = np.zeros((self.img_h, self.img_w), dtype=np.float32)
+        center_h, center_w = self.img_h // 2, self.img_w // 2
+        local_drone_pos_map[center_h, center_w] = 1.0
+
+        # 3. !! 恢复：将两个通道堆叠起来 !!
+        map_obs = np.stack([local_reward_map, local_drone_pos_map], axis=0)
 
         # --- 动态生成动作掩码 ---
         # 动作0: 通信, 动作1: 定位
@@ -143,15 +252,15 @@ class DroneNavigationEnv(gym.Env):
 
         # 判断定位是否稳定
         if self.radius_stable_steps < self.stable_threshold:
-            # 定位不稳定阶段：强制或优先进行定位
-            # 掩码为 [0, 1]，意味着只有动作1（定位）是可用的
+            # 定位不稳定阶段：可以进行定位和通信
+            action_mask[0, 0] = 1
             action_mask[0, 1] = 1
         else:
             # 定位稳定阶段：优先进行通信
             # 掩码为 [1, 1]，意味着两个动作都可用，让智能体自己决定
-            # 也可以设为 [1, 0] 来强制通信，但允许两个动作通常更灵活
+            # 设为 [1, 0] 来强制通信
             action_mask[0, 0] = 1
-            action_mask[0, 1] = 1
+            action_mask[0, 1] = 0
         return {
             "map": map_obs,
             "sensors": self.sensor_states,
@@ -162,8 +271,10 @@ class DroneNavigationEnv(gym.Env):
     def _get_info(self):
         """辅助函数：返回一些用于调试的额外信息。"""
         return {
-            "drone_position": self.drone_position,
-            "steps": self.current_step
+            "drone_position": self.drone_position.copy(),
+            "steps": self.current_step,
+            "stable_steps": self.radius_stable_steps,
+            "remaining_data_total": np.sum(self.sensor_data_amounts)
         }
 
     def reset(self, seed=None, options=None):
@@ -171,7 +282,11 @@ class DroneNavigationEnv(gym.Env):
         重置环境到初始状态。
         """
         super().reset(seed=seed)
-
+        # --- 清空日志列表 ---
+        self.trajectory = []
+        self.communication_log = []
+        self.localization_log = []
+        self.reward_components = []  # 如果也想记录奖励的分解项
         # ... 在这里实现重置环境的逻辑 ...
         self.radius_stable_steps = 0
         self.previous_radii = np.full(self.num_sensors, 100.0)  # 初始半径都是100m
@@ -205,6 +320,7 @@ class DroneNavigationEnv(gym.Env):
 
         # 4. 初始化无人机状态
         self.drone_position = np.array([0.0, 0.0])
+        self.trajectory.append(self.drone_position.copy())
         self.drone_height = 60.0 # 60m
 
         # 5. 构建符合观测空间的'sensors'状态矩阵
@@ -278,10 +394,19 @@ class DroneNavigationEnv(gym.Env):
                 f"与传感器 {target_sensor_idx} 通信成功。SNR: {snr_linear:.2f} dB, 传输数据: {transmitted_data / 1e6:.2f} Mbits")
         else:
             print(f"与传感器 {target_sensor_idx} 通信失败。SNR: {snr_linear_est:.2f} dB (低于阈值 {self.snr_threshold_db} dB)")
-
         # 6. 更新传感器的剩余数据量
         current_data = self.sensor_data_amounts[target_sensor_idx]
         self.sensor_data_amounts[target_sensor_idx] = max(0, current_data - transmitted_data)
+        # --- 新增：记录通信日志 ---
+        log_entry = {
+            'step': self.current_step,
+            'action': 'communication',
+            'target_sensor': target_sensor_idx,
+            'snr_linear': snr_linear,
+            'transmitted_data_Mbits': transmitted_data / 1e6,
+            'remaining_data': self.sensor_data_amounts.copy()  # 记录所有传感器当前的数据量
+        }
+        self.communication_log.append(log_entry)
 
     def _execute_localization(self):
         """
@@ -323,6 +448,14 @@ class DroneNavigationEnv(gym.Env):
             # c. 从模型中获取更新后的状态，同步到环境自身的状态变量中
             self.sensor_estimated_positions = self.uncertainty_model.estimated_positions.copy()
             self.sensor_estimated_radii = self.uncertainty_model.uncertainty_radii.copy()
+            # --- 新增：在模型更新后记录定位日志 ---
+            log_entry = {
+                'step': self.current_step,
+                'action': 'localization_update',  # 标记这是一个更新事件
+                'est_positions': self.sensor_estimated_positions.copy(),
+                'est_radii': self.sensor_estimated_radii.copy()
+            }
+            self.localization_log.append(log_entry)
             # d. 现在，在半径真正更新后，再检查稳定性
             radius_change = np.abs(self.sensor_estimated_radii - radii_before_update)
             if np.all(radius_change < 0.5):  # 假设变化小于0.5米算稳定
@@ -332,6 +465,8 @@ class DroneNavigationEnv(gym.Env):
                 self.radius_stable_steps = 0  # 如果有任何一个半径变化大，则重置计数器
                 print(f"半径变化大，稳定计数器重置为: 0")
             print(f"更新后半径: {np.round(self.sensor_estimated_radii, 2)}")
+
+
 
     def step(self, action):
         """
@@ -372,26 +507,38 @@ class DroneNavigationEnv(gym.Env):
             # 执行定位逻辑...
             self._execute_localization()
 
-        # 示例：简单的奖励 (离目标越近奖励越高)
-        target_sensor_idx = discrete_action[0]
-        target_pos = self.sensor_states[target_sensor_idx, :2]  # 假设前两位是位置
-        distance = np.linalg.norm(self.drone_position - target_pos)
-        reward = -distance  # 距离越近，负奖励越小
+        # 5. 更新用于观测的'sensors'矩阵
+        self.sensor_states = np.concatenate([
+            self.sensor_estimated_positions,
+            self.sensor_estimated_radii.reshape(-1, 1),
+            self.sensor_data_amounts.reshape(-1, 1)
+        ], axis=1).astype(np.float32)
 
+        # 6. 计算奖励
+        # 【注意】奖励函数现在需要在这里调用
+        current_reward_map = self._compute_current_local_reward_map()
+        reward = self._calculate_reward(current_reward_map)
         self.current_step += 1
 
-        # --- 3. 判断 episode 是否结束 ---
-        # 如果达到目标，或者发生碰撞等
-        terminated = bool(distance < 0.05)
-        # 如果达到最大步数
-        truncated = bool(self.current_step >= self.max_steps_per_episode)
+        # --- 7. 判断 episode 是否结束 ---
+        # !! 关键修改：当所有传感器数据量为0时，任务完成 !!
+        all_data_collected = np.all(self.sensor_data_amounts == 0)
+        max_steps_reached = self.current_step >= self.max_steps_per_episode
 
-        # --- 4. 获取下一步的观测和信息 ---
+        terminated = bool(all_data_collected)
+        truncated = bool(max_steps_reached)
+
+        # --- 8. 获取下一步的观测和信息 ---
         observation = self._get_obs()
         info = self._get_info()
 
+        # --- 9. 任务成功或超时后的额外处理 ---
         if terminated:
-            reward += 10  # 到达目标的额外奖励
-            print(f"目标达成！奖励: {reward}")
+            # 任务成功完成，给予一个大的正奖励
+            reward += 200  # 您可以调整这个数值
+            print(f"所有数据采集完毕！任务成功。Episode 结束。")
+
+        if truncated:
+            print(f"达到最大步数 {self.max_steps_per_episode}，任务超时。Episode 结束。")
 
         return observation, reward, terminated, truncated, info
