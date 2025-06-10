@@ -278,60 +278,63 @@ class DroneNavigationEnv(gym.Env):
         action_mask_con = np.array([[-1.0, 1.0], [-1.0, 1.0]], dtype=np.float32)
 
         # 仅当定位稳定且需要优先通信时，才施加方向约束
-        if is_stable:
-            # a. 确定通信目标 (与 _execute_communication 逻辑一致)
-            eligible_sensors_mask = self.sensor_data_amounts > 0
-            horizontal_dist_to_est_center = np.linalg.norm(
-                self.drone_position - self.sensor_estimated_positions, axis=1
-            )
-            max_horizontal_dist = horizontal_dist_to_est_center + self.sensor_estimated_radii
-            max_dist_3d_all = np.sqrt(max_horizontal_dist ** 2 + self.drone_height ** 2)
-            # 将不合格的传感器的距离设置为无穷大，使其永远不会被选中
-            distances_to_consider = np.where(eligible_sensors_mask, max_dist_3d_all, np.inf)
-            # 选择合格者中距离最近的传感器
-            target_sensor_idx = np.argmin(distances_to_consider)
 
-            # b. 计算指向目标传感器的方向 (角度)
-            target_pos = self.sensor_estimated_positions[target_sensor_idx]
-            direction_vector = target_pos - self.drone_position
+        # if is_stable: 试试不管定位稳不稳定都使用连续动作遮罩
 
-            # 使用 arctan2 计算从-pi到pi的角度
-            target_direction_rad = np.arctan2(direction_vector[1], direction_vector[0])
+        # a. 确定通信目标 (与 _execute_communication 逻辑一致)
+        eligible_sensors_mask = self.sensor_data_amounts > 0
+        horizontal_dist_to_est_center = np.linalg.norm(
+            self.drone_position - self.sensor_estimated_positions, axis=1
+        )
+        max_horizontal_dist = horizontal_dist_to_est_center + self.sensor_estimated_radii
+        max_dist_3d_all = np.sqrt(max_horizontal_dist ** 2 + self.drone_height ** 2)
+        # 将不合格的传感器的距离设置为无穷大，使其永远不会被选中
+        distances_to_consider = np.where(eligible_sensors_mask, max_dist_3d_all, np.inf)
+        # 选择合格者中距离最近的传感器
+        target_sensor_idx = np.argmin(distances_to_consider)
 
-            # c. 定义一个可接受的角度范围 (例如，目标方向 ± 15度)
-            angle_tolerance_rad = np.deg2rad(15)
-            min_angle_rad = target_direction_rad - angle_tolerance_rad
-            max_angle_rad = target_direction_rad + angle_tolerance_rad
+        # b. 计算指向目标传感器的方向 (角度)
+        target_pos = self.sensor_estimated_positions[target_sensor_idx]
+        direction_vector = target_pos - self.drone_position
 
-            # d. 将真实角度范围 [-pi, pi] 映射到归一化范围 [-1, 1]
+        # 使用 arctan2 计算从-pi到pi的角度
+        target_direction_rad = np.arctan2(direction_vector[1], direction_vector[0])
+
+        # c. 定义一个可接受的角度范围 (例如，目标方向 ± 15度)
+        angle_tolerance_rad = np.deg2rad(15)
+        min_angle_rad = target_direction_rad - angle_tolerance_rad
+        max_angle_rad = target_direction_rad + angle_tolerance_rad
+
+        # d. 将真实角度范围 [-pi, pi] 映射到归一化范围 [-1, 1]
+        # 归一化函数: norm_val = (real_val - low) / (high - low) * 2 - 1
+        low_dir_real = self.real_action_bounds['direction']['low']  # -pi
+        high_dir_real = self.real_action_bounds['direction']['high']  # +pi
+
+        norm_min_angle = (min_angle_rad - low_dir_real) / (high_dir_real - low_dir_real) * 2 - 1
+        norm_max_angle = (max_angle_rad - low_dir_real) / (high_dir_real - low_dir_real) * 2 - 1
+
+        # 处理角度环绕问题 (例如，目标是-175度，范围可能跨越-180/180度)
+        # 简单处理：如果最小归一化值大于最大值，说明跨越了边界，暂时不加约束
+        if norm_min_angle < norm_max_angle:
+            action_mask_con[0, :] = [norm_min_angle, norm_max_angle]
+
+        # e. (可选) 也可以对速度施加约束，例如，强制高速飞行
+        # --- 新增规则2：如果上一步通信失败，约束速度 ---
+        if not self.last_comm_success:
+            # a. 定义真实速度的高速范围 [20, 30] m/s
+            high_speed_min_real = 20.0
+            high_speed_max_real = 30.0
+            # b. 获取速度的真实边界 [0, 30] m/s
+            low_speed_real = self.real_action_bounds['speed']['low']
+            high_speed_real = self.real_action_bounds['speed']['high']
+            # c. 将真实的高速范围映射到归一化范围 [-1, 1]
             # 归一化函数: norm_val = (real_val - low) / (high - low) * 2 - 1
-            low_dir_real = self.real_action_bounds['direction']['low']  # -pi
-            high_dir_real = self.real_action_bounds['direction']['high']  # +pi
+            norm_min_speed = (high_speed_min_real - low_speed_real) / (high_speed_real - low_speed_real) * 2 - 1
+            norm_max_speed = (high_speed_max_real - low_speed_real) / (high_speed_real - low_speed_real) * 2 - 1
+            # d. 应用速度约束
+            action_mask_con[1, :] = [norm_min_speed, norm_max_speed]
+            print(f"上一步通信失败，应用速度约束: [{norm_min_speed:.2f}, {norm_max_speed:.2f}]")
 
-            norm_min_angle = (min_angle_rad - low_dir_real) / (high_dir_real - low_dir_real) * 2 - 1
-            norm_max_angle = (max_angle_rad - low_dir_real) / (high_dir_real - low_dir_real) * 2 - 1
-
-            # 处理角度环绕问题 (例如，目标是-175度，范围可能跨越-180/180度)
-            # 简单处理：如果最小归一化值大于最大值，说明跨越了边界，暂时不加约束
-            if norm_min_angle < norm_max_angle:
-                action_mask_con[0, :] = [norm_min_angle, norm_max_angle]
-
-            # e. (可选) 也可以对速度施加约束，例如，强制高速飞行
-            # --- 新增规则2：如果上一步通信失败，约束速度 ---
-            if not self.last_comm_success:
-                # a. 定义真实速度的高速范围 [20, 30] m/s
-                high_speed_min_real = 20.0
-                high_speed_max_real = 30.0
-                # b. 获取速度的真实边界 [0, 30] m/s
-                low_speed_real = self.real_action_bounds['speed']['low']
-                high_speed_real = self.real_action_bounds['speed']['high']
-                # c. 将真实的高速范围映射到归一化范围 [-1, 1]
-                # 归一化函数: norm_val = (real_val - low) / (high - low) * 2 - 1
-                norm_min_speed = (high_speed_min_real - low_speed_real) / (high_speed_real - low_speed_real) * 2 - 1
-                norm_max_speed = (high_speed_max_real - low_speed_real) / (high_speed_real - low_speed_real) * 2 - 1
-                # d. 应用速度约束
-                action_mask_con[1, :] = [norm_min_speed, norm_max_speed]
-                print(f"上一步通信失败，应用速度约束: [{norm_min_speed:.2f}, {norm_max_speed:.2f}]")
         return {
             "map": map_obs,
             "sensors": self.sensor_states,
@@ -570,7 +573,7 @@ class DroneNavigationEnv(gym.Env):
 
         # 将归一化动作转换为真实动作
         real_direction, real_speed = self._unnormalize_action(normalized_continuous_action)
-
+        print(f"无人机移动角度: [{real_direction:.2f},无人机移动速度 {real_speed:.2f}]")
         # --- 2. 在这里实现您的核心环境动力学 ---
         # ... 根据 discrete_action 和 continuous_action 更新环境状态 ...
         # --- 更新无人机位置 (基于连续动作) ---
@@ -579,6 +582,7 @@ class DroneNavigationEnv(gym.Env):
             real_speed * np.cos(real_direction),
             real_speed * np.sin(real_direction)
         ])
+
         # b. 根据速度和时间步长更新位置: new_pos = old_pos + velocity * time
         self.drone_position += move_vector * self.time_slot
         # c. 边界检查，确保无人机不会飞出定义的区域
