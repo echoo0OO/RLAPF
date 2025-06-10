@@ -77,8 +77,8 @@ class DroneNavigationEnv(gym.Env):
         self.reference_distance = 1.0 # m
         self.reference_loss = -60  # dB
         self.transmit_power = 0.1  # W
-        self.noise_power = 1e-11  # W (-110dBm)
-        self.snr_threshold = 10.0  # dB
+        self.noise_power = 1e-12  # W (从-110dBm改为-120dBm)
+        self.snr_threshold = 2.0  # dB 从10dB减小到3dB，即2倍（线性）
         self.delay_penalty_coefficient = 2e7 #时延系数=单个SN数据量
         # 定位参数
         # 在 __init__ 中实例化 GDOPCalculator
@@ -199,29 +199,46 @@ class DroneNavigationEnv(gym.Env):
         根据当前状态（无人机位置、传感器状态），计算并返回当前的局部奖励地图。
         这个函数是当前步骤中所有奖励地图计算的唯一来源。
         """
-        # a. 为当前局部视图生成坐标网格
-        local_X_mesh, local_Y_mesh = self._generate_local_view_grid()
+        # a. 为当前局部视图生成坐标网格 (高分辨率)
+        local_X_mesh_high, local_Y_mesh_high = self._generate_local_view_grid()
 
         # b. 为每个传感器计算其贡献的奖励层
+        # --- 新增：生成低分辨率网格用于GDOP计算 ---
+        LOW_RES = 10  # 例如，在10x10的网格上计算
+        half_view = self.local_view_size / 2.0
+        center_x, center_y = self.drone_position
+        min_x, max_x = center_x - half_view, center_x + half_view
+        min_y, max_y = center_y - half_view, center_y + half_view
+        local_x_coords_low = np.linspace(min_x, max_x, LOW_RES)
+        local_y_coords_low = np.linspace(min_y, max_y, LOW_RES)
+        local_X_mesh_low, local_Y_mesh_low = np.meshgrid(local_x_coords_low, local_y_coords_low)
+
         map_reward_layers = []
         for i in range(self.num_sensors):
-            # 如果传感器数据已采完，则其吸引力（R_max）为0
             current_R_max = self.R_max_base if self.sensor_data_amounts[i] > 0 else 0.0
 
-            # 计算APF奖励层
+            # APF层仍然在高分辨率上计算，因为它很快
             apf_layer = reward_function_apf(
-                local_X_mesh, local_Y_mesh,
+                local_X_mesh_high, local_Y_mesh_high,
                 R_max=current_R_max,
                 r_threshold=self.sensor_estimated_radii[i],
                 xc=self.sensor_estimated_positions[i][0],
                 yc=self.sensor_estimated_positions[i][1]
             )
 
-            # 计算GDOP遮罩层
-            gdop_mask_layer = self._calculate_gdop_mask_for_sensor(i, local_X_mesh, local_Y_mesh)
+            # GDOP遮罩层在低分辨率上计算
+            # !! 传入低分辨率网格 !!
+            gdop_mask_layer_low = self._calculate_gdop_mask_for_sensor(i, local_X_mesh_low, local_Y_mesh_low)
 
-            # 应用遮罩并添加到列表中
-            map_reward_layers.append(apf_layer * gdop_mask_layer)
+            # --- 新增：将低分辨率遮罩插值放大到高分辨率 ---
+            # 使用OpenCV进行快速插值
+            gdop_mask_layer_high = cv2.resize(
+                gdop_mask_layer_low,
+                (self.img_w, self.img_h),
+                interpolation=cv2.INTER_LINEAR  # 线性插值
+            )
+
+            map_reward_layers.append(apf_layer * gdop_mask_layer_high)
 
         # c. 融合所有层，得到最终的局部奖励地图
         if not map_reward_layers:  # 如果列表为空
@@ -278,7 +295,6 @@ class DroneNavigationEnv(gym.Env):
         action_mask_con = np.array([[-1.0, 1.0], [-1.0, 1.0]], dtype=np.float32)
 
         # 仅当定位稳定且需要优先通信时，才施加方向约束
-
         # if is_stable: 试试不管定位稳不稳定都使用连续动作遮罩
 
         # a. 确定通信目标 (与 _execute_communication 逻辑一致)
