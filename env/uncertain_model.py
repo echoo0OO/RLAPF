@@ -10,7 +10,19 @@ class UncertaintyModel:
     """传感器位置不确定性模型"""
     ranging_noise_std: float
 
-    def __init__(self, num_sensors: int, confidence_level: float = 0.99):
+    # 在 uncertain_model.py 的 UncertaintyModel 类中添加此方法
+    def initialize_states(self, true_positions, initial_radius, np_random):
+        self.true_positions = true_positions  # 仅为模拟目的存储
+        self.estimated_positions = np.array([
+            true_pos + np_random.uniform(-initial_radius / 2, initial_radius / 2, 2)
+            for true_pos in self.true_positions
+        ])
+        self.covariance_matrices = np.array([np.eye(2) * initial_radius ** 2 for _ in range(self.num_sensors)])
+        self.uncertainty_radii = np.full(self.num_sensors, initial_radius)
+        self.ranging_points = [[] for _ in range(self.num_sensors)]
+        self.ranging_distances = [[] for _ in range(self.num_sensors)]
+
+    def __init__(self, num_sensors: int, confidence_level: float = 0.95):
         """
         初始化不确定性模型
         
