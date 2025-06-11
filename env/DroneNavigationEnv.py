@@ -387,10 +387,19 @@ class DroneNavigationEnv(gym.Env):
         self.current_step = 0
 
         # 2. 生成传感器的真实位置 (源自 sensornet.py)
-        # 使用泊松盘采样保证传感器之间有最小距离
-        self.sensor_true_positions = poisson_disk_sampling(
-            self.area_size, self.num_sensors, min_dist=250.0, np_random=self.np_random
+        # a. 定义边界安全距离
+        margin = 100.0
+        # b. 在一个缩小的区域内进行泊松盘采样
+        sampling_width = self.area_size[0] - 2 * margin
+        sampling_height = self.area_size[1] - 2 * margin
+        points_in_smaller_area = poisson_disk_sampling(
+            (sampling_width, sampling_height),
+            self.num_sensors,
+            min_dist=250.0,
+            np_random=self.np_random
         )
+        # c. 将所有点平移，使其位于 [margin, area_size - margin] 的范围内
+        self.sensor_true_positions = points_in_smaller_area + np.array([margin, margin])
 
         # 3. 初始化传感器的估计状态 (源自 sensornet.py)
         # a. 初始估计半径都为100m
@@ -589,7 +598,7 @@ class DroneNavigationEnv(gym.Env):
 
         # 将归一化动作转换为真实动作
         real_direction, real_speed = self._unnormalize_action(normalized_continuous_action)
-        print(f"无人机移动角度: [{real_direction:.2f},无人机移动速度 {real_speed:.2f}]")
+        #print(f"无人机移动角度: [{real_direction:.2f},无人机移动速度 {real_speed:.2f}]")
         # --- 2. 在这里实现您的核心环境动力学 ---
         # ... 根据 discrete_action 和 continuous_action 更新环境状态 ...
         # --- 更新无人机位置 (基于连续动作) ---
@@ -650,6 +659,7 @@ class DroneNavigationEnv(gym.Env):
             print(f"所有数据采集完毕！任务成功。Episode 结束。")
 
         if truncated:
+            reward -= 1500
             print(f"达到最大步数 {self.max_steps_per_episode}，任务超时。Episode 结束。")
 
         return observation, reward, terminated, truncated, info

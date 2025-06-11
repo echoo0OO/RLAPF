@@ -105,7 +105,15 @@ class UncertaintyModel:
             # 加权最小二乘解
             AtWA = A.T @ W @ A
             AtWb = A.T @ W @ b
-            
+
+            # --- 【新增的鲁棒性检查】 ---
+            # 检查矩阵的条件数。如果太大，说明矩阵病态，解不可靠。
+            # 一个经验阈值可以是 1e5 或 1e6。
+            if np.linalg.cond(AtWA) > 1e6:
+                # print(f"警告: 传感器{sensor_id}的AtWA矩阵条件数过高，本次更新跳过。")
+                return self.estimated_positions[sensor_id], self.covariance_matrices[sensor_id]
+            # --- 检查结束 ---
+
             if np.linalg.det(AtWA) < 1e-10:
                 # 矩阵奇异，返回当前估计
                 return self.estimated_positions[sensor_id], self.covariance_matrices[sensor_id]

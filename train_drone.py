@@ -99,7 +99,7 @@ def train():
     os.makedirs("./models", exist_ok=True)
 
     # --- 4. 训练循环 ---
-    max_train_episodes = 5001  # 训练5000个回合
+    max_train_episodes = 501  # 训练5000个回合 5000→500
 
     for episode in range(max_train_episodes):
         obs_dict, info = env.reset()
