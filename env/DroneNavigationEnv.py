@@ -506,11 +506,10 @@ class DroneNavigationEnv(gym.Env):
             throughput_bps = self.bandwidth * np.log2(1 + snr_linear)
             # 在一个时隙内传输的数据量
             transmitted_data = throughput_bps * self.time_slot
-            print(
-                f"与传感器 {target_sensor_idx} 通信成功。SNR: {snr_linear:.2f} , 传输数据: {transmitted_data / 1e6:.2f} Mbits")
+            #print(f"与传感器 {target_sensor_idx} 通信成功。SNR: {snr_linear:.2f} , 传输数据: {transmitted_data / 1e6:.2f} Mbits")
         else:
             self.last_comm_success = False
-            print(f"与传感器 {target_sensor_idx} 通信失败。SNR: {snr_linear_est:.2f}  (低于阈值 {self.snr_threshold} )")
+            #print(f"与传感器 {target_sensor_idx} 通信失败。SNR: {snr_linear_est:.2f}  (低于阈值 {self.snr_threshold} )")
         # 6. 更新传感器的剩余数据量
         current_data = self.sensor_data_amounts[target_sensor_idx]
         self.sensor_data_amounts[target_sensor_idx] = max(0, current_data - transmitted_data)
@@ -533,65 +532,47 @@ class DroneNavigationEnv(gym.Env):
         """
         # 执行定位时，认为通信状态是“好的” !!
         self.last_comm_success = True
-        # 1. 计算到所有传感器的真实水平距离 (2D)
-        true_horizontal_dist = np.linalg.norm(self.drone_position - self.sensor_true_positions, axis=1)
+        # --- 1. 记录更新前的状态，用于稳定性检查 ---
+        radii_before_update = self.uncertainty_model.uncertainty_radii.copy()
 
-        # 2. 根据2D距离模型生成带噪声的测量值
-        # 方差 variance = g0 * (distance^2)
+        # --- 2. 为每个传感器生成一次测量并立即进行EKF更新 ---
+        true_horizontal_dist = np.linalg.norm(self.drone_position - self.sensor_true_positions, axis=1)
         variances_2d = self.g0 * (true_horizontal_dist ** 2)
         std_devs_2d = np.sqrt(variances_2d)
         measured_distances_2d = self.np_random.normal(loc=true_horizontal_dist, scale=std_devs_2d)
 
-        # 3. 将2D测量数据添加到不确定性模型中
         for i in range(self.num_sensors):
-            # 调用 uncertainty_model 的接口，传入2D测量值
-            self.uncertainty_model.add_ranging_measurement(
+            # 【核心修改】直接调用 EKF 更新
+            self.uncertainty_model.ekf_update_step(
                 sensor_id=i,
                 drone_position=self.drone_position,
                 measured_distance=measured_distances_2d[i],
-                measurement_variance=variances_2d[i]  # <-- 传入方差
+                measurement_variance=variances_2d[i]
             )
 
-        # 4. 检查是否需要触发模型更新
-        self.ranging_point_counter += 1
-        if self.ranging_point_counter >= self.ranging_update_interval:
-            print(f"已收集 {self.ranging_point_counter} 个新测距点，触发不确定性模型更新...")
-            self.ranging_point_counter = 0  # 重置计数器
+            # --- 3. 从模型同步状态并记录日志 ---
+            # (这部分逻辑现在是每次定位都执行，不再需要计数器)
+        self.sensor_estimated_positions = self.uncertainty_model.estimated_positions.copy()
+        self.sensor_estimated_radii = self.uncertainty_model.uncertainty_radii.copy()
 
-            # --- 关键修改：在这里更新稳定计数器 ---
-            # a. 先保存更新前的半径，用于比较
-            radii_before_update = self.uncertainty_model.uncertainty_radii.copy()
 
-            # b. 对每个传感器调用更新方法，这会改变模型内部的估计值
-            for i in range(self.num_sensors):
-                self.uncertainty_model.update_sensor_estimate(sensor_id=i)
-            # c. 从模型中获取更新后的状态，同步到环境自身的状态变量中
-            self.sensor_estimated_positions = self.uncertainty_model.estimated_positions.copy()
-            self.sensor_estimated_radii = self.uncertainty_model.uncertainty_radii.copy()
-
-            # 【修改】将打印调试信息移到这里，使用更新后的值
-            for i in range(self.num_sensors):
-                error = np.linalg.norm(self.sensor_estimated_positions[i] - self.sensor_true_positions[i])
-                radius = self.sensor_estimated_radii[i]
-                print(f"传感器 {i} 的估计误差为: {error:.2f} m, 估计半径为: {radius:.2f} m")
-
-            # --- 新增：在模型更新后记录定位日志 ---
-            log_entry = {
-                'step': self.current_step,
-                'action': 'localization_update',  # 标记这是一个更新事件
-                'est_positions': self.sensor_estimated_positions.copy(),
-                'est_radii': self.sensor_estimated_radii.copy()
-            }
-            self.localization_log.append(log_entry)
-            # d. 现在，在半径真正更新后，再检查稳定性
-            radius_change = np.abs(self.sensor_estimated_radii - radii_before_update)
-            if np.all(radius_change < 0.5):  # 假设变化小于0.5米算稳定
-                self.radius_stable_steps += 1
-                print(f"半径变化小，稳定计数器增加到: {self.radius_stable_steps}")
-            else:
-                self.radius_stable_steps = 0  # 如果有任何一个半径变化大，则重置计数器
-                print(f"半径变化大，稳定计数器重置为: 0")
-            print(f"更新后半径: {np.round(self.sensor_estimated_radii, 2)}")
+        # --- 新增：在模型更新后记录定位日志 ---
+        log_entry = {
+            'step': self.current_step,
+            'action': 'localization_update',  # 标记这是一个更新事件
+            'est_positions': self.sensor_estimated_positions.copy(),
+            'est_radii': self.sensor_estimated_radii.copy()
+        }
+        self.localization_log.append(log_entry)
+        # d. 现在，在半径真正更新后，再检查稳定性
+        radius_change = np.abs(self.sensor_estimated_radii - radii_before_update)
+        if np.all(radius_change < 0.5):  # 假设变化小于0.5米算稳定
+            self.radius_stable_steps += 1
+            print(f"半径变化小，稳定计数器增加到: {self.radius_stable_steps}")
+        else:
+            self.radius_stable_steps = 0  # 如果有任何一个半径变化大，则重置计数器
+            print(f"半径变化大，稳定计数器重置为: 0")
+        print(f"更新后半径: {np.round(self.sensor_estimated_radii, 2)}")
 
 
 
@@ -627,7 +608,7 @@ class DroneNavigationEnv(gym.Env):
         # d. 记录轨迹点，用于后续的可视化
         if self.current_step % self.trajectory_save_freq == 0:
             self.trajectory.append(self.drone_position.copy())
-
+        print(f"离散动作是{discrete_action},0是通信1是定位")
         if discrete_action == 0:
             # 执行通信逻辑...
             self._execute_communication()
@@ -659,6 +640,16 @@ class DroneNavigationEnv(gym.Env):
         # --- 8. 获取下一步的观测和信息 ---
         observation = self._get_obs()
         info = self._get_info()
+
+        # --- 【新增】: 在每一步的最后，周期性地打印系统状态 ---
+        if self.current_step % 20 == 0:  # 每20步打印一次，无论做什么动作
+            print(f"\n--- Status at Step {self.current_step} ---")
+            for i in range(self.num_sensors):
+                error = np.linalg.norm(self.sensor_estimated_positions[i] - self.sensor_true_positions[i])
+                radius = self.sensor_estimated_radii[i]  # 可以直接用 self.uncertainty_radii
+                print(
+                    f"  Sensor {i} | Error: {error:6.2f}m | Radius: {radius:6.2f}m | Data: {self.sensor_data_amounts[i] / 1e6:5.2f} Mbits")
+            print(f"  Drone Position: ({self.drone_position[0]:.1f}, {self.drone_position[1]:.1f})")
 
         # --- 9. 任务成功或超时后的额外处理 ---
         if terminated:

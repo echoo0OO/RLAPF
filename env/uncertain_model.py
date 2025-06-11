@@ -17,12 +17,10 @@ class UncertaintyModel:
             true_pos + np_random.uniform(-initial_radius / 2, initial_radius / 2, 2)
             for true_pos in self.true_positions
         ])
+        # 【修改】初始化协方差 P0
         self.covariance_matrices = np.array([np.eye(2) * initial_radius ** 2 for _ in range(self.num_sensors)])
         self.uncertainty_radii = np.full(self.num_sensors, initial_radius)
-        self.ranging_points = [[] for _ in range(self.num_sensors)]
-        #self.ranging_distances = [[] for _ in range(self.num_sensors)]
-        # 【修改】
-        self.ranging_measurements = [[] for _ in range(self.num_sensors)]
+        # 不再需要 ranging_points 和 ranging_measurements 历史记录
 
     def __init__(self, num_sensors: int, confidence_level: float = 0.99): # 置信度由0.95改到0.99
         """
@@ -36,7 +34,9 @@ class UncertaintyModel:
         self.confidence_level = confidence_level
         
         # 传感器估计位置和协方差矩阵
+        # EKF状态: 估计位置和协方差矩阵
         self.estimated_positions = np.zeros((num_sensors, 2))
+        # 【修改】P矩阵是EKF的核心
         self.covariance_matrices = np.array([np.eye(2) * 100**2 for _ in range(num_sensors)])
         self.uncertainty_radii = np.full(num_sensors, 100.0)
         
@@ -48,123 +48,43 @@ class UncertaintyModel:
         
         # 定位误差模型参数
         #self.ranging_noise_std = 5.0  # 测距噪声标准差
-        
-    def add_ranging_measurement(self, sensor_id: int, drone_position: np.ndarray, 
-                              measured_distance: float, measurement_variance: float):
+
+    # 2. 【核心修改】用EKF更新步骤替换所有旧逻辑
+    def ekf_update_step(self, sensor_id: int, drone_position: np.ndarray,
+                        measured_distance: float, measurement_variance: float):
         """
-        添加测距测量数据
-        
-        Args:
-            sensor_id: 传感器ID
-            drone_position: 无人机位置
-            measured_distance: 测量距离
+        使用单个测量对传感器的状态进行EKF更新。
         """
-        self.ranging_points[sensor_id].append(drone_position.copy())
-        #self.ranging_distances[sensor_id].append(measured_distance)
-        # 【修改】
-        self.ranging_measurements[sensor_id].append((measured_distance, measurement_variance))
-        
-        # 限制历史记录长度
-        max_history = 50
-        if len(self.ranging_points[sensor_id]) > max_history:
-            self.ranging_points[sensor_id].pop(0)
-            #self.ranging_distances[sensor_id].pop(0)
-            self.ranging_measurements[sensor_id].pop(0)
-
-    def nonlinear_least_squares_estimation(self, sensor_id: int, max_iterations=10, tolerance=1e-6):
-        """
-        非线性最小二乘法 (Gauss-Newton) 位置估计。
-        这能提供更准确的估计和协方差。
-        """
-        points_2d = np.array(self.ranging_points[sensor_id])
-        measurements = self.ranging_measurements[sensor_id]
-
-        # 1. 使用上一次的估计作为初始猜测
-        current_estimate = self.estimated_positions[sensor_id].copy()
-
-        num_measurements = len(points_2d)
-        if num_measurements < 3:
-            return self.estimated_positions[sensor_id], self.covariance_matrices[sensor_id]
-
-        # 准备权重矩阵的逆（即方差矩阵）
-        variances = np.array([m[1] for m in measurements])
-        # 权重是方差的倒数
-        W = np.diag(1.0 / variances)
-
-        # 2. 迭代优化
-        for i in range(max_iterations):
-            # a. 构建雅可比矩阵 J 和残差向量 r
-            J = np.zeros((num_measurements, 2))
-            r = np.zeros(num_measurements)
-
-            for k in range(num_measurements):
-                drone_pos = points_2d[k]
-                measured_dist = measurements[k][0]
-
-                # 计算当前估计下的预测距离
-                diff_vec = drone_pos - current_estimate
-                estimated_dist = np.linalg.norm(diff_vec)
-                if estimated_dist < 1e-6: estimated_dist = 1e-6  # 避免除以零
-
-                # 计算残差 (观测值 - 预测值)
-                r[k] = measured_dist - estimated_dist
-
-                # 计算雅可比矩阵的一行 (残差对x, y的偏导)
-                J[k, 0] = -diff_vec[0] / estimated_dist
-                J[k, 1] = -diff_vec[1] / estimated_dist
-
-            # b. 求解线性子问题 (J^T * W * J) * dx = J^T * W * r
-            try:
-                JtWJ = J.T @ W @ J
-                JtWr = J.T @ W @ r
-
-                # 检查矩阵条件，防止数值不稳定
-                if np.linalg.det(JtWJ) < 1e-12 or np.linalg.cond(JtWJ) > 1e8:
-                    # 如果矩阵病态，说明几何构型很差，无法继续优化，返回当前结果
-                    print(f"警告: 传感器{sensor_id}的JtWJ矩阵病态，迭代提前终止。")
-                    # 此时的协方差更可信
-                    final_covariance = np.linalg.inv(JtWJ)
-                    return current_estimate, final_covariance
-
-                delta_x = np.linalg.solve(JtWJ, JtWr)
-            except np.linalg.LinAlgError:
-                print(f"警告: 传感器{sensor_id}的NLS求解失败，迭代提前终止。")
-                return self.estimated_positions[sensor_id], self.covariance_matrices[sensor_id]
-
-            # c. 更新估计值
-            current_estimate += delta_x
-
-            # d. 检查收敛
-            if np.linalg.norm(delta_x) < tolerance:
-                # print(f"传感器{sensor_id} NLS在 {i+1} 次迭代后收敛。")
-                break
-
-        # 3. 计算最终的协方差矩阵
-        # 理论上，参数的协方差矩阵是 (J^T * W * J)^-1
-        try:
-            final_covariance = np.linalg.inv(J.T @ W @ J)
-        except np.linalg.LinAlgError:
-            # 如果最后一步还是出错，返回上一次的协方差
-            return current_estimate, self.covariance_matrices[sensor_id]
-
-        return current_estimate, final_covariance
-    
-    def update_sensor_estimate(self, sensor_id: int):
-        """更新传感器位置估计 (使用NLS)"""
-        if len(self.ranging_points[sensor_id]) < 3:
-            return
-
-        # 使用非线性最小二乘法进行更新
-        new_pos, new_cov = self.nonlinear_least_squares_estimation(sensor_id)
-
-        # 添加一个检查，防止更新结果跳跃过大
-        if np.linalg.norm(new_pos - self.estimated_positions[sensor_id]) < 200: # 如果更新跳跃小于200米
-            self.estimated_positions[sensor_id] = new_pos
-            self.covariance_matrices[sensor_id] = new_cov
-            self.uncertainty_radii[sensor_id] = self.calculate_confidence_radius(new_cov)
-        else:
-            print(f"警告：传感器{sensor_id}的NLS更新跳跃过大，已忽略本次更新。")
-    
+        # --- 1. 获取当前状态 (预测步骤，由于状态静止，预测=当前) ---
+        x_priori = self.estimated_positions[sensor_id]
+        P_priori = self.covariance_matrices[sensor_id]
+        # --- 2. 计算更新所需项 ---
+        # a. 计算雅可比矩阵 H (在EKF中通常用H表示)
+        diff_vec = drone_position - x_priori
+        estimated_dist = np.linalg.norm(diff_vec)
+        if estimated_dist < 1e-6: return  # 距离太近，更新不稳定
+        H = (-diff_vec / estimated_dist).reshape(1, 2)  # 必须是 1x2 的行向量
+        # b. 计算卡尔曼增益 K
+        # K = P' * H^T * (H * P' * H^T + R)^-1
+        H_P_Ht = H @ P_priori @ H.T
+        # R 是测量噪声方差，是一个 1x1 标量
+        R = measurement_variance
+        # (H * P' * H^T + R) 是一个 1x1 矩阵，求逆就是取倒数
+        S = H_P_Ht[0, 0] + R
+        if S < 1e-9: return  # 避免除以零
+        K = (P_priori @ H.T) / S  # K 是一个 2x1 的列向量
+        # --- 3. 更新状态和协方差 ---
+        # a. 计算残差 y
+        residual = measured_distance - estimated_dist
+        # b. 更新状态估计 x_post = x_priori + K * y
+        x_post = x_priori + (K * residual).flatten()
+        # c. 更新协方差 P_post = (I - K * H) * P_priori
+        I_KH = np.eye(2) - K @ H
+        P_post = I_KH @ P_priori
+        # --- 4. 保存更新后的结果 ---
+        self.estimated_positions[sensor_id] = x_post
+        self.covariance_matrices[sensor_id] = P_post
+        self.uncertainty_radii[sensor_id] = self.calculate_confidence_radius(P_post)
     def calculate_confidence_radius(self, covariance_matrix: np.ndarray) -> float:
         """
         计算置信椭圆长轴作为不确定性半径
