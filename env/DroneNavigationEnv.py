@@ -349,7 +349,7 @@ class DroneNavigationEnv(gym.Env):
             norm_max_speed = (high_speed_max_real - low_speed_real) / (high_speed_real - low_speed_real) * 2 - 1
             # d. 应用速度约束
             action_mask_con[1, :] = [norm_min_speed, norm_max_speed]
-            print(f"上一步通信失败，应用速度约束: [{norm_min_speed:.2f}, {norm_max_speed:.2f}]")
+            #print(f"上一步通信失败，应用速度约束: [{norm_min_speed:.2f}, {norm_max_speed:.2f}]")
 
         return {
             "map": map_obs,
@@ -548,7 +548,8 @@ class DroneNavigationEnv(gym.Env):
             self.uncertainty_model.add_ranging_measurement(
                 sensor_id=i,
                 drone_position=self.drone_position,
-                measured_distance=measured_distances_2d[i]
+                measured_distance=measured_distances_2d[i],
+                measurement_variance=variances_2d[i]  # <-- 传入方差
             )
 
         # 4. 检查是否需要触发模型更新
@@ -567,6 +568,9 @@ class DroneNavigationEnv(gym.Env):
             # c. 从模型中获取更新后的状态，同步到环境自身的状态变量中
             self.sensor_estimated_positions = self.uncertainty_model.estimated_positions.copy()
             self.sensor_estimated_radii = self.uncertainty_model.uncertainty_radii.copy()
+            for i in range(self.num_sensors):
+                errors = np.linalg.norm(self.sensor_estimated_positions[i] - self.sensor_true_positions[i], axis=1)
+                print(f"传感器 {i} 的估计误差为: {errors:.2f} m,估计半径为: {self.sensor_estimated_radii[i]:.2f} m")
             # --- 新增：在模型更新后记录定位日志 ---
             log_entry = {
                 'step': self.current_step,

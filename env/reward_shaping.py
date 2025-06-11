@@ -11,7 +11,7 @@ def reward_function_apf(x_coords_mesh, y_coords_mesh, R_max, r_threshold, xc, yc
     """
     APF形式的混合奖励函数，来自show5_3APF.py
     """
-    effective_r_threshold = max(r_threshold, 10.0)
+    effective_r_threshold = max(r_threshold, 20.0)*3 #最小值10→20
     c1 = R_max / 3.0
     d = np.sqrt((x_coords_mesh - xc) ** 2 + (y_coords_mesh - yc) ** 2)
     reward = np.zeros_like(d)

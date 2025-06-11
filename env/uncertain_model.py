@@ -8,7 +8,7 @@ mpl.rcParams['axes.unicode_minus'] = False           # 解决保存图像是负�
 
 class UncertaintyModel:
     """传感器位置不确定性模型"""
-    ranging_noise_std: float
+    #ranging_noise_std: float
 
     # 在 uncertain_model.py 的 UncertaintyModel 类中添加此方法
     def initialize_states(self, true_positions, initial_radius, np_random):
@@ -20,7 +20,9 @@ class UncertaintyModel:
         self.covariance_matrices = np.array([np.eye(2) * initial_radius ** 2 for _ in range(self.num_sensors)])
         self.uncertainty_radii = np.full(self.num_sensors, initial_radius)
         self.ranging_points = [[] for _ in range(self.num_sensors)]
-        self.ranging_distances = [[] for _ in range(self.num_sensors)]
+        #self.ranging_distances = [[] for _ in range(self.num_sensors)]
+        # 【修改】
+        self.ranging_measurements = [[] for _ in range(self.num_sensors)]
 
     def __init__(self, num_sensors: int, confidence_level: float = 0.99): # 置信度由0.95改到0.99
         """
@@ -40,13 +42,15 @@ class UncertaintyModel:
         
         # 测距点历史记录
         self.ranging_points = [[] for _ in range(num_sensors)]
-        self.ranging_distances = [[] for _ in range(num_sensors)]
+        #self.ranging_distances = [[] for _ in range(num_sensors)]
+        # 【修改】现在存储 (measured_distance, variance) 的元组
+        self.ranging_measurements = [[] for _ in range(self.num_sensors)]
         
         # 定位误差模型参数
-        self.ranging_noise_std = 5.0  # 测距噪声标准差
+        #self.ranging_noise_std = 5.0  # 测距噪声标准差
         
     def add_ranging_measurement(self, sensor_id: int, drone_position: np.ndarray, 
-                              measured_distance: float):
+                              measured_distance: float, measurement_variance: float):
         """
         添加测距测量数据
         
@@ -56,13 +60,16 @@ class UncertaintyModel:
             measured_distance: 测量距离
         """
         self.ranging_points[sensor_id].append(drone_position.copy())
-        self.ranging_distances[sensor_id].append(measured_distance)
+        #self.ranging_distances[sensor_id].append(measured_distance)
+        # 【修改】
+        self.ranging_measurements[sensor_id].append((measured_distance, measurement_variance))
         
         # 限制历史记录长度
         max_history = 50
         if len(self.ranging_points[sensor_id]) > max_history:
             self.ranging_points[sensor_id].pop(0)
-            self.ranging_distances[sensor_id].pop(0)
+            #self.ranging_distances[sensor_id].pop(0)
+            self.ranging_measurements[sensor_id].pop(0)
     
     def weighted_least_squares_estimation(self, sensor_id: int) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -75,7 +82,8 @@ class UncertaintyModel:
             估计位置和协方差矩阵
         """
         points = np.array(self.ranging_points[sensor_id])
-        distances = np.array(self.ranging_distances[sensor_id])
+        #distances = np.array(self.ranging_distances[sensor_id])
+        measurements = self.ranging_measurements[sensor_id]
         
         if len(points) < 3:
             # 测量点不足，返回当前估计
@@ -88,19 +96,30 @@ class UncertaintyModel:
         
         # 以第一个点为参考
         x0, y0 = points[0]
-        r0 = distances[0]
-        
+        r0, var0 = measurements[0]
+
+        # 【修改】构建权重矩阵的对角线元素
+        weights_diag = []
+
         for i in range(1, n):
             xi, yi = points[i]
-            ri = distances[i]
+            ri, vari = measurements[i]
             
             A[i-1, 0] = 2 * (xi - x0)
             A[i-1, 1] = 2 * (yi - y0)
             b[i-1] = xi**2 - x0**2 + yi**2 - y0**2 + r0**2 - ri**2
-        
-        # 权重矩阵（简化为单位矩阵）
-        W = np.eye(n-1)
-        
+
+            # 线性化后的残差方差是原始测量方差的和
+            # e_i = (d_i^2 - d_0^2) - ( (x_s-x_i)^2+(y_s-y_i)^2 - (x_s-x_0)^2-(y_s-y_0)^2 )
+            # var(e_i) ≈ var(r_i^2 - r_0^2) ≈ 4*r_i^2*var(r_i) + 4*r_0^2*var(r_0)
+            # 这是一个更复杂的模型。我们先用一个简化但更合理的模型：
+            # 权重是测量噪声协方差的逆。对于线性化方程，权重应与线性化后的误差方差成反比。
+            # 一个合理的简化是 var(b[i-1]) 正比于 var(r_i) + var(r_0)。
+            # 我们直接使用 1 / (vari + var0) 作为权重。
+            weight_val = 1.0 / (vari + var0)
+            weights_diag.append(weight_val)
+        # 【修改】构建正确的权重矩阵 W
+        W = np.diag(weights_diag)
         try:
             # 加权最小二乘解
             AtWA = A.T @ W @ A
@@ -109,20 +128,22 @@ class UncertaintyModel:
             # --- 【新增的鲁棒性检查】 ---
             # 检查矩阵的条件数。如果太大，说明矩阵病态，解不可靠。
             # 一个经验阈值可以是 1e5 或 1e6。
-            if np.linalg.cond(AtWA) > 1e6:
-                # print(f"警告: 传感器{sensor_id}的AtWA矩阵条件数过高，本次更新跳过。")
+            if np.linalg.det(AtWA) < 1e-10 or np.linalg.cond(AtWA) > 1e8:
                 return self.estimated_positions[sensor_id], self.covariance_matrices[sensor_id]
-            # --- 检查结束 ---
 
-            if np.linalg.det(AtWA) < 1e-10:
-                # 矩阵奇异，返回当前估计
-                return self.estimated_positions[sensor_id], self.covariance_matrices[sensor_id]
             
             estimated_pos = np.linalg.solve(AtWA, AtWb)
-            
-            # 计算协方差矩阵
-            sigma2 = self.ranging_noise_std**2
-            covariance = sigma2 * np.linalg.inv(AtWA)
+
+            # 【修改】计算协方差矩阵。
+            # 在WLS理论中，如果权重W是测量误差协方差的逆，
+            # 那么参数的协方差就是 (A^T * W * A)^-1。
+            # 这里不再需要乘以一个额外的 sigma2。
+            # 这个 sigma_squared_hat 是“后验方差因子”，理想情况下应该接近1。
+            # residuals = b - A @ estimated_pos
+            # sigma_squared_hat = (residuals.T @ W @ residuals) / (n - 1 - 2)
+            # covariance = sigma_squared_hat * np.linalg.inv(AtWA)
+            # 我们先用理论值，即直接求逆。
+            covariance = np.linalg.inv(AtWA)
             
             return estimated_pos, covariance
             
