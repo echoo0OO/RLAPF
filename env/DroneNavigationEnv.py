@@ -102,7 +102,7 @@ class DroneNavigationEnv(gym.Env):
         self.trajectory_save_freq = 5
         # --- 新增: 追踪定位稳定性的状态变量 ---
         self.radius_stable_steps = 0  # 连续多少步半径变化很小
-        self.stable_threshold = 3  # 需要连续多少步才算稳定
+        self.stable_threshold = 4  # 需要连续多少步才算稳定 3→4
         # 存储上一步的半径，用于比较变化
         self.previous_radii = None
 

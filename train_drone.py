@@ -8,7 +8,7 @@ import os
 # 从您的文件中导入核心类
 from env.DroneNavigationEnv import DroneNavigationEnv
 from hppo.hppo_actionmask_CNN import PPO_Hybrid
-from visualization_utils import plot_trajectory, plot_remaining_data, plot_position_error, plot_uncertainty_radius
+from visualization_utils import plot_trajectory, plot_remaining_data, plot_position_error, plot_uncertainty_radius, plot_episode_rewards
 
 
 def flatten_observation(obs_dict, obs_space):
@@ -101,6 +101,7 @@ def train():
     # --- 4. 训练循环 ---
     max_train_episodes = 501  # 训练5000个回合 5000→500
 
+    all_episode_rewards = []  # 用于存储每个episode的总奖励
     for episode in range(max_train_episodes):
         obs_dict, info = env.reset()
         current_ep_reward = 0
@@ -158,7 +159,7 @@ def train():
         # ------------------------------------------------------------------
         # !! 关键修改：所有日志和绘图逻辑都移到 while 循环之外 !!
         # ------------------------------------------------------------------
-
+        all_episode_rewards.append(current_ep_reward)  # 记录当前episode的奖励
         # --- 5. 日志记录 (每个episode结束时打印) ---
         print(f"Episode: {episode}, Reward: {current_ep_reward:.2f}, Steps: {env.current_step}")
 
@@ -184,6 +185,11 @@ def train():
             save_path = f"./models/ppo_drone_episode_{episode}.pth"
             agent.save(save_path)
             print(f"模型已保存至: {save_path}\n")
+
+    # --- 训练结束后，生成最终的奖励曲线图 ---
+    print("\n--- Training Complete: Generating Final Reward Curve ---")
+    plot_episode_rewards(all_episode_rewards, "./plots/total_rewards_over_training.png", moving_avg_window=20)
+    print("Total reward curve plot saved to ./plots/total_rewards_over_training.png")
 
     env.close()
 

@@ -102,3 +102,39 @@ def plot_uncertainty_radius(loc_log, save_path):
     plt.legend()
     plt.savefig(save_path)
     plt.close()
+
+
+def plot_episode_rewards(rewards, save_path, moving_avg_window=10):
+    """
+    绘制每个episode的总奖励，并包含一个移动平均线来显示趋势。
+
+    Args:
+        rewards (list): 包含每个episode奖励的列表。
+        save_path (str): 图像保存路径。
+        moving_avg_window (int): 用于计算移动平均的窗口大小。
+    """
+    plt.figure(figsize=(12, 6))
+
+    # 绘制原始的逐episode奖励
+    plt.plot(rewards, label='Episode Reward', color='lightblue', alpha=0.8)
+
+    # 计算并绘制移动平均线
+    if len(rewards) >= moving_avg_window:
+        # 使用卷积计算移动平均，这是一种高效的方法
+        # 'valid'模式确保只在有完整窗口数据时才计算平均值
+        moving_avg = np.convolve(rewards, np.ones(moving_avg_window) / moving_avg_window, mode='valid')
+
+        # 移动平均线的x轴需要对齐
+        # 第一个移动平均值对应于原始数据的第 `moving_avg_window - 1` 个点
+        moving_avg_x_axis = np.arange(moving_avg_window - 1, len(rewards))
+
+        plt.plot(moving_avg_x_axis, moving_avg, color='red', linewidth=2,
+                 label=f'Moving Average (window={moving_avg_window})')
+
+    plt.title('Total Reward per Episode Over Training')
+    plt.xlabel('Episode')
+    plt.ylabel('Total Reward')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.legend()
+    plt.savefig(save_path)
+    plt.close()
