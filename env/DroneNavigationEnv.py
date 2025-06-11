@@ -568,9 +568,13 @@ class DroneNavigationEnv(gym.Env):
             # c. 从模型中获取更新后的状态，同步到环境自身的状态变量中
             self.sensor_estimated_positions = self.uncertainty_model.estimated_positions.copy()
             self.sensor_estimated_radii = self.uncertainty_model.uncertainty_radii.copy()
+
+            # 【修改】将打印调试信息移到这里，使用更新后的值
             for i in range(self.num_sensors):
-                errors = np.linalg.norm(self.sensor_estimated_positions[i] - self.sensor_true_positions[i], axis=1)
-                print(f"传感器 {i} 的估计误差为: {errors:.2f} m,估计半径为: {self.sensor_estimated_radii[i]:.2f} m")
+                error = np.linalg.norm(self.sensor_estimated_positions[i] - self.sensor_true_positions[i])
+                radius = self.sensor_estimated_radii[i]
+                print(f"传感器 {i} 的估计误差为: {error:.2f} m, 估计半径为: {radius:.2f} m")
+
             # --- 新增：在模型更新后记录定位日志 ---
             log_entry = {
                 'step': self.current_step,

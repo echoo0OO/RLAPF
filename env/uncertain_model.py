@@ -70,96 +70,100 @@ class UncertaintyModel:
             self.ranging_points[sensor_id].pop(0)
             #self.ranging_distances[sensor_id].pop(0)
             self.ranging_measurements[sensor_id].pop(0)
-    
-    def weighted_least_squares_estimation(self, sensor_id: int) -> Tuple[np.ndarray, np.ndarray]:
+
+    def nonlinear_least_squares_estimation(self, sensor_id: int, max_iterations=10, tolerance=1e-6):
         """
-        加权最小二乘法位置估计
-        
-        Args:
-            sensor_id: 传感器ID
-            
-        Returns:
-            估计位置和协方差矩阵
+        非线性最小二乘法 (Gauss-Newton) 位置估计。
+        这能提供更准确的估计和协方差。
         """
-        points = np.array(self.ranging_points[sensor_id])
-        #distances = np.array(self.ranging_distances[sensor_id])
+        points_2d = np.array(self.ranging_points[sensor_id])
         measurements = self.ranging_measurements[sensor_id]
-        
-        if len(points) < 3:
-            # 测量点不足，返回当前估计
+
+        # 1. 使用上一次的估计作为初始猜测
+        current_estimate = self.estimated_positions[sensor_id].copy()
+
+        num_measurements = len(points_2d)
+        if num_measurements < 3:
             return self.estimated_positions[sensor_id], self.covariance_matrices[sensor_id]
-        
-        # 构建线性化方程组 Ax = b
-        n = len(points)
-        A = np.zeros((n-1, 2))
-        b = np.zeros(n-1)
-        
-        # 以第一个点为参考
-        x0, y0 = points[0]
-        r0, var0 = measurements[0]
 
-        # 【修改】构建权重矩阵的对角线元素
-        weights_diag = []
+        # 准备权重矩阵的逆（即方差矩阵）
+        variances = np.array([m[1] for m in measurements])
+        # 权重是方差的倒数
+        W = np.diag(1.0 / variances)
 
-        for i in range(1, n):
-            xi, yi = points[i]
-            ri, vari = measurements[i]
-            
-            A[i-1, 0] = 2 * (xi - x0)
-            A[i-1, 1] = 2 * (yi - y0)
-            b[i-1] = xi**2 - x0**2 + yi**2 - y0**2 + r0**2 - ri**2
+        # 2. 迭代优化
+        for i in range(max_iterations):
+            # a. 构建雅可比矩阵 J 和残差向量 r
+            J = np.zeros((num_measurements, 2))
+            r = np.zeros(num_measurements)
 
-            # 线性化后的残差方差是原始测量方差的和
-            # e_i = (d_i^2 - d_0^2) - ( (x_s-x_i)^2+(y_s-y_i)^2 - (x_s-x_0)^2-(y_s-y_0)^2 )
-            # var(e_i) ≈ var(r_i^2 - r_0^2) ≈ 4*r_i^2*var(r_i) + 4*r_0^2*var(r_0)
-            # 这是一个更复杂的模型。我们先用一个简化但更合理的模型：
-            # 权重是测量噪声协方差的逆。对于线性化方程，权重应与线性化后的误差方差成反比。
-            # 一个合理的简化是 var(b[i-1]) 正比于 var(r_i) + var(r_0)。
-            # 我们直接使用 1 / (vari + var0) 作为权重。
-            weight_val = 1.0 / (vari + var0)
-            weights_diag.append(weight_val)
-        # 【修改】构建正确的权重矩阵 W
-        W = np.diag(weights_diag)
-        try:
-            # 加权最小二乘解
-            AtWA = A.T @ W @ A
-            AtWb = A.T @ W @ b
+            for k in range(num_measurements):
+                drone_pos = points_2d[k]
+                measured_dist = measurements[k][0]
 
-            # --- 【新增的鲁棒性检查】 ---
-            # 检查矩阵的条件数。如果太大，说明矩阵病态，解不可靠。
-            # 一个经验阈值可以是 1e5 或 1e6。
-            if np.linalg.det(AtWA) < 1e-10 or np.linalg.cond(AtWA) > 1e8:
+                # 计算当前估计下的预测距离
+                diff_vec = drone_pos - current_estimate
+                estimated_dist = np.linalg.norm(diff_vec)
+                if estimated_dist < 1e-6: estimated_dist = 1e-6  # 避免除以零
+
+                # 计算残差 (观测值 - 预测值)
+                r[k] = measured_dist - estimated_dist
+
+                # 计算雅可比矩阵的一行 (残差对x, y的偏导)
+                J[k, 0] = -diff_vec[0] / estimated_dist
+                J[k, 1] = -diff_vec[1] / estimated_dist
+
+            # b. 求解线性子问题 (J^T * W * J) * dx = J^T * W * r
+            try:
+                JtWJ = J.T @ W @ J
+                JtWr = J.T @ W @ r
+
+                # 检查矩阵条件，防止数值不稳定
+                if np.linalg.det(JtWJ) < 1e-12 or np.linalg.cond(JtWJ) > 1e8:
+                    # 如果矩阵病态，说明几何构型很差，无法继续优化，返回当前结果
+                    print(f"警告: 传感器{sensor_id}的JtWJ矩阵病态，迭代提前终止。")
+                    # 此时的协方差更可信
+                    final_covariance = np.linalg.inv(JtWJ)
+                    return current_estimate, final_covariance
+
+                delta_x = np.linalg.solve(JtWJ, JtWr)
+            except np.linalg.LinAlgError:
+                print(f"警告: 传感器{sensor_id}的NLS求解失败，迭代提前终止。")
                 return self.estimated_positions[sensor_id], self.covariance_matrices[sensor_id]
 
-            
-            estimated_pos = np.linalg.solve(AtWA, AtWb)
+            # c. 更新估计值
+            current_estimate += delta_x
 
-            # 【修改】计算协方差矩阵。
-            # 在WLS理论中，如果权重W是测量误差协方差的逆，
-            # 那么参数的协方差就是 (A^T * W * A)^-1。
-            # 这里不再需要乘以一个额外的 sigma2。
-            # 这个 sigma_squared_hat 是“后验方差因子”，理想情况下应该接近1。
-            # residuals = b - A @ estimated_pos
-            # sigma_squared_hat = (residuals.T @ W @ residuals) / (n - 1 - 2)
-            # covariance = sigma_squared_hat * np.linalg.inv(AtWA)
-            # 我们先用理论值，即直接求逆。
-            covariance = np.linalg.inv(AtWA)
-            
-            return estimated_pos, covariance
-            
+            # d. 检查收敛
+            if np.linalg.norm(delta_x) < tolerance:
+                # print(f"传感器{sensor_id} NLS在 {i+1} 次迭代后收敛。")
+                break
+
+        # 3. 计算最终的协方差矩阵
+        # 理论上，参数的协方差矩阵是 (J^T * W * J)^-1
+        try:
+            final_covariance = np.linalg.inv(J.T @ W @ J)
         except np.linalg.LinAlgError:
-            # 数值问题，返回当前估计
-            return self.estimated_positions[sensor_id], self.covariance_matrices[sensor_id]
+            # 如果最后一步还是出错，返回上一次的协方差
+            return current_estimate, self.covariance_matrices[sensor_id]
+
+        return current_estimate, final_covariance
     
     def update_sensor_estimate(self, sensor_id: int):
-        """更新传感器位置估计"""
-        if len(self.ranging_points[sensor_id]) >= 3:
-            new_pos, new_cov = self.weighted_least_squares_estimation(sensor_id)
+        """更新传感器位置估计 (使用NLS)"""
+        if len(self.ranging_points[sensor_id]) < 3:
+            return
+
+        # 使用非线性最小二乘法进行更新
+        new_pos, new_cov = self.nonlinear_least_squares_estimation(sensor_id)
+
+        # 添加一个检查，防止更新结果跳跃过大
+        if np.linalg.norm(new_pos - self.estimated_positions[sensor_id]) < 200: # 如果更新跳跃小于200米
             self.estimated_positions[sensor_id] = new_pos
             self.covariance_matrices[sensor_id] = new_cov
-            
-            # 计算置信椭圆长轴作为不确定性半径
             self.uncertainty_radii[sensor_id] = self.calculate_confidence_radius(new_cov)
+        else:
+            print(f"警告：传感器{sensor_id}的NLS更新跳跃过大，已忽略本次更新。")
     
     def calculate_confidence_radius(self, covariance_matrix: np.ndarray) -> float:
         """
