@@ -99,7 +99,7 @@ def train():
     os.makedirs("./models", exist_ok=True)
 
     # --- 4. 训练循环 ---
-    max_train_episodes = 3001  # 训练5000个回合 5000→500→3000
+    max_train_episodes = 2001  # 训练5000个回合 5000→500→3000→2000
 
     all_episode_rewards = []  # 用于存储每个episode的总奖励
     for episode in range(max_train_episodes):
@@ -129,7 +129,7 @@ def train():
             # 注意：您的PPOBuffer实现似乎需要logp是单个numpy值或特定形状的数组，这里做了相应处理
             agent.buffer.store_hybrid(
                 flat_obs,
-                {"discrete_mask": obs_dict["action_mask_discrete"]},
+                action_mask_dict,  # <-- 之前是 {"discrete_mask": ...}, 现在传递整个字典
                 np.array([action_dis]),  # 确保是数组
                 action_con,
                 reward,

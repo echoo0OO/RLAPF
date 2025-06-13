@@ -42,7 +42,7 @@ class DroneNavigationEnv(gym.Env):
         self.action_con_dim = config.get("action_con_dim", 2)
         self.area_size = config.get("area_size", (1000.0, 1000.0))
         self.solo_SN_data = config.get("solo_SN_data", 2e7)
-        self.max_steps_per_episode = config.get("max_steps", 500)
+        self.max_steps_per_episode = config.get("max_steps", 500) # 500 → 1000 → 500
         self.local_view_size = config.get("local_view_size", 150.0)  # 局部视图为 150m x 150m
 
         # --- 1. 定义复杂的观测空间 (使用 spaces.Dict) ---
@@ -70,7 +70,7 @@ class DroneNavigationEnv(gym.Env):
         self.num_sensors = 5
         self.max_speed = 30.0  # m/s
         self.time_slot = 1.0  # s
-        self.solo_SN_data = 2e7 #20Mbits
+        self.solo_SN_data = 2e7 #20Mbits → 40 → 60 → 20
         # 通信参数
         self.bandwidth = 1e6 # 1MHz
         self.path_loss_exponent = 2
@@ -85,7 +85,7 @@ class DroneNavigationEnv(gym.Env):
         self.gdop_calc = GDOPCalculator()
         self.g0 = config.get("g0", 1.125e-5) # 测量噪声方差系数
         self.uncertainty_model = UncertaintyModel(num_sensors=self.num_sensors)
-        self.R_max_base = 100.0
+        self.R_max_base = 30.0 # 100.0 → 30.0
         # 用于触发定位模型更新的计数器
         self.ranging_update_interval = 10
         self.ranging_point_counter = 0
@@ -102,7 +102,7 @@ class DroneNavigationEnv(gym.Env):
         self.trajectory_save_freq = 5
         # --- 新增: 追踪定位稳定性的状态变量 ---
         self.radius_stable_steps = 0  # 连续多少步半径变化很小
-        self.stable_threshold = 4  # 需要连续多少步才算稳定 3→4
+        self.stable_threshold = 10  # 需要连续多少步才算稳定 3→4→10
         # 存储上一步的半径，用于比较变化
         self.previous_radii = None
 
@@ -258,14 +258,68 @@ class DroneNavigationEnv(gym.Env):
         map_based_reward = current_reward_map[center_h, center_w]
 
         # --- 2. 计算时延惩罚 ---
-        data_collected = self.solo_SN_data - self.sensor_data_amounts
-        total_data_collected = np.sum(data_collected)
-        delay_penalty = - (total_data_collected / self.delay_penalty_coefficient)
+        total_data_uncollected = np.sum(self.sensor_data_amounts)
+
+        delay_penalty =  (total_data_uncollected / self.delay_penalty_coefficient)*3 # *1 → *5
 
         # --- 3. 计算总奖励 ---
-        total_reward = map_based_reward + delay_penalty
+        total_reward = map_based_reward - delay_penalty
 
         return total_reward
+
+    def _calculate_gdop_penalty(self) -> float:
+        """
+        计算无人机当前位置对“最不确定”的传感器所产生的GDOP惩罚。
+        GDOP值越差（越大），惩罚越大（负得越多）。
+        """
+        # --- 1. 找到当前最不确定的传感器（拥有最大不确定性半径）---
+        # 我们只惩罚对最需要帮助的传感器的定位效果
+        if np.all(self.sensor_data_amounts <= 0):
+            return 0.0  # 如果所有数据都收集完了，就不再有定位惩罚
+
+        eligible_mask = self.sensor_data_amounts > 0
+        uncertainty_radii_eligible = np.where(eligible_mask, self.sensor_estimated_radii, -1.0)
+        target_sensor_idx = np.argmax(uncertainty_radii_eligible)
+
+        # --- 2. 获取该传感器的历史测距点 ---
+        # 我们需要历史点+当前点来构成一个定位网络
+        historical_points_2d = self.uncertainty_model.ranging_points[target_sensor_idx]
+
+        # 构造用于计算GDOP的测量网络（历史点 + 当前无人机位置）
+        # 将2D点转换为3D点（无人机高度固定）
+        current_network_3d = [np.append(p, self.drone_height) for p in historical_points_2d]
+        current_network_3d.append(np.append(self.drone_position, self.drone_height))
+
+        # 要定位的目标（传感器在地面上，z=0）
+        sensor_to_locate_3d = np.append(self.sensor_estimated_positions[target_sensor_idx], 0.0)
+
+        # --- 3. 计算GDOP值 ---
+        # 如果测量点少于3个，无法定位，给予最大惩罚
+        if len(current_network_3d) < 3:
+            return -20.0  # 返回一个固定的较大惩罚值
+
+        # 计算权重 (1/方差)
+        weights = np.zeros(len(current_network_3d))
+        for k, p_loc_3d in enumerate(current_network_3d):
+            dist_3d = np.linalg.norm(p_loc_3d - sensor_to_locate_3d)
+            variance = self.g0 * (dist_3d ** 2)
+            weights[k] = 1.0 / variance if variance > 1e-9 else 1e9
+
+        # 调用GDOP计算器
+        gdop_value = self.gdop_calc.calculate_gdop_for_fixed_target(
+            sensor_to_locate_3d, current_network_3d, weights
+        )
+
+        # --- 4. 将GDOP值转换为惩罚 ---
+        if gdop_value == float('inf') or gdop_value > 50:  # 如果GDOP非常差
+            return -20.0
+
+        # GDOP值越小越好。我们希望惩罚大的GDOP值。
+        # 使用一个简单的线性惩罚，可以设置一个上限，避免惩罚过大。
+        GDOP_PENALTY_COEFFICIENT = 0.5  # 超参数，需要调试
+        penalty = -gdop_value * GDOP_PENALTY_COEFFICIENT
+
+        return penalty
 
     def _get_obs(self):
         """辅助函数：根据当前环境状态生成一个符合观测空间的字典。"""
@@ -316,8 +370,8 @@ class DroneNavigationEnv(gym.Env):
         # 使用 arctan2 计算从-pi到pi的角度
         target_direction_rad = np.arctan2(direction_vector[1], direction_vector[0])
 
-        # c. 定义一个可接受的角度范围 (例如，目标方向 ± 15度)
-        angle_tolerance_rad = np.deg2rad(15)
+        # c. 定义一个可接受的角度范围 (例如，目标方向 ± 15度 )
+        angle_tolerance_rad = np.deg2rad(15) #15 → 30 →15
         min_angle_rad = target_direction_rad - angle_tolerance_rad
         max_angle_rad = target_direction_rad + angle_tolerance_rad
 
@@ -568,11 +622,11 @@ class DroneNavigationEnv(gym.Env):
         radius_change = np.abs(self.sensor_estimated_radii - radii_before_update)
         if np.all(radius_change < 0.5):  # 假设变化小于0.5米算稳定
             self.radius_stable_steps += 1
-            print(f"半径变化小，稳定计数器增加到: {self.radius_stable_steps}")
+            #print(f"半径变化小，稳定计数器增加到: {self.radius_stable_steps}")
         else:
             self.radius_stable_steps = 0  # 如果有任何一个半径变化大，则重置计数器
-            print(f"半径变化大，稳定计数器重置为: 0")
-        print(f"更新后半径: {np.round(self.sensor_estimated_radii, 2)}")
+            #print(f"半径变化大，稳定计数器重置为: 0")
+        #print(f"更新后半径: {np.round(self.sensor_estimated_radii, 2)}")
 
 
 
@@ -608,7 +662,7 @@ class DroneNavigationEnv(gym.Env):
         # d. 记录轨迹点，用于后续的可视化
         if self.current_step % self.trajectory_save_freq == 0:
             self.trajectory.append(self.drone_position.copy())
-        print(f"离散动作是{discrete_action},0是通信1是定位")
+
         if discrete_action == 0:
             # 执行通信逻辑...
             self._execute_communication()
@@ -627,7 +681,9 @@ class DroneNavigationEnv(gym.Env):
         # 【注意】奖励函数现在需要在这里调用
         current_reward_map = self._compute_current_local_reward_map()
         reward = self._calculate_reward(current_reward_map)
-        self.current_step += 1
+        #添加GDOP惩罚
+        gdop_penalty = self._calculate_gdop_penalty()
+        reward += gdop_penalty
 
         # --- 7. 判断 episode 是否结束 ---
         # !! 关键修改：当所有传感器数据量为0时，任务完成 !!
@@ -642,7 +698,7 @@ class DroneNavigationEnv(gym.Env):
         info = self._get_info()
 
         # --- 【新增】: 在每一步的最后，周期性地打印系统状态 ---
-        if self.current_step % 20 == 0:  # 每20步打印一次，无论做什么动作
+        if self.current_step % 50 == 0:  # 每20步打印一次，无论做什么动作
             print(f"\n--- Status at Step {self.current_step} ---")
             for i in range(self.num_sensors):
                 error = np.linalg.norm(self.sensor_estimated_positions[i] - self.sensor_true_positions[i])

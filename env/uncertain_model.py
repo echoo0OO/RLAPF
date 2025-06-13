@@ -46,8 +46,11 @@ class UncertaintyModel:
         # 【修改】现在存储 (measured_distance, variance) 的元组
         self.ranging_measurements = [[] for _ in range(self.num_sensors)]
         
-        # 定位误差模型参数
-        #self.ranging_noise_std = 5.0  # 测距噪声标准差
+
+        # 定义一个小的过程噪声，防止滤波器过于自信
+        # q_val 的值需要调试，可以从一个很小的值开始，比如 0.001
+        q_val = 1e-5 #0.01→1e-5
+        self.process_noise_q = np.eye(2) * q_val
 
     # 2. 【核心修改】用EKF更新步骤替换所有旧逻辑
     def ekf_update_step(self, sensor_id: int, drone_position: np.ndarray,
@@ -57,7 +60,9 @@ class UncertaintyModel:
         """
         # --- 1. 获取当前状态 (预测步骤，由于状态静止，预测=当前) ---
         x_priori = self.estimated_positions[sensor_id]
-        P_priori = self.covariance_matrices[sensor_id]
+        P_current = self.covariance_matrices[sensor_id]
+        # 这会告诉滤波器：“别太相信你自己的估计，它可能在悄悄地漂移”
+        P_priori = P_current + self.process_noise_q
         # --- 2. 计算更新所需项 ---
         # a. 计算雅可比矩阵 H (在EKF中通常用H表示)
         diff_vec = drone_position - x_priori

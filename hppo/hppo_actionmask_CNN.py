@@ -86,9 +86,18 @@ class PPOBuffer:
 
     def __init__(self, obs_dim, act_dis_dim, act_dis_len, act_con_dim, size, gamma, lam, device):
         self.obs_buf = np.zeros((size, obs_dim), dtype=np.float32)
-        self.action_mask_buf = np.ones((size, act_dis_dim * act_dis_len), dtype=np.float32)
+
+        # 重命名 action_mask_buf 为 action_mask_dis_buf 以明确其用途
+        self.action_mask_dis_buf = np.ones((size, act_dis_dim * act_dis_len), dtype=np.float32)
+        # 新增一个缓冲区来存储连续动作的掩码 (shape: batch, action_dim, 2 for min/max)
+        self.action_mask_con_buf = np.zeros((size, act_con_dim, 2), dtype=np.float32)
+        # --- 修改结束 ---
         self.act_dis_buf = np.zeros((size, act_dis_dim), dtype=np.int64)
         self.act_con_buf = np.zeros((size, act_con_dim), dtype=np.float32)
+
+        # self.action_mask_buf = np.ones((size, act_dis_dim * act_dis_len), dtype=np.float32)
+        # self.act_dis_buf = np.zeros((size, act_dis_dim), dtype=np.int64)
+        # self.act_con_buf = np.zeros((size, act_con_dim), dtype=np.float32)
         self.adv_buf = np.zeros(size, dtype=np.float32)
         self.rew_buf = np.zeros(size, dtype=np.float32)
         self.ret_buf = np.zeros(size, dtype=np.float32)
@@ -108,8 +117,13 @@ class PPOBuffer:
         """
         assert self.ptr < self.max_size
         self.obs_buf[self.ptr] = obs
-        # 注意: action_mask现在是一个字典，需要扁平化存储
-        self.action_mask_buf[self.ptr] = action_mask['discrete_mask'].flatten()
+        # # 注意: action_mask现在是一个字典，需要扁平化存储
+        # self.action_mask_buf[self.ptr] = action_mask['discrete_mask'].flatten()
+
+        # 现在存储离散和连续的掩码
+        self.action_mask_dis_buf[self.ptr] = action_mask['discrete_mask'].flatten()
+        self.action_mask_con_buf[self.ptr] = action_mask['continuous_mask']
+
         self.act_dis_buf[self.ptr] = act_dis
         self.act_con_buf[self.ptr] = act_con
         self.rew_buf[self.ptr] = rew
@@ -130,6 +144,10 @@ class PPOBuffer:
     def get(self, batch_size):
         obs_buf = self.obs_buf[:self.ptr]
         action_mask_buf = self.action_mask_buf[:self.ptr]
+
+        action_mask_dis_buf = self.action_mask_dis_buf[:self.ptr]
+        action_mask_con_buf = self.action_mask_con_buf[:self.ptr]
+
         act_dis_buf = self.act_dis_buf[:self.ptr]
         act_con_buf = self.act_con_buf[:self.ptr]
         adv_buf = self.adv_buf[:self.ptr]
@@ -148,6 +166,11 @@ class PPOBuffer:
 
         for indices in sampler:
             yield (
+
+                # 将两个掩码都传递出去
+                torch.as_tensor(action_mask_dis_buf[indices], dtype=torch.float32, device=self.device),
+                torch.as_tensor(action_mask_con_buf[indices], dtype=torch.float32, device=self.device),
+
                 torch.as_tensor(obs_buf[indices], dtype=torch.float32, device=self.device),
                 torch.as_tensor(action_mask_buf[indices], dtype=torch.float32, device=self.device),
                 torch.as_tensor(act_dis_buf[indices], dtype=torch.int64, device=self.device),
@@ -237,9 +260,17 @@ class ActorCritic_Hybrid_Attention(nn.Module):
         dist_entropy_dis = dist_dis.entropy().sum(dim=-1)
 
         # 连续动作
-        mean = self.actor_con_head(fused_vector)
+        mean_raw = self.actor_con_head(fused_vector)
         std = torch.exp(self.log_std)
-        dist_con = Normal(mean, std)
+
+        # 获取连续动作掩码的边界
+        con_mask_bounds = action_mask['continuous_mask']
+        # 像 select_action 中一样，裁剪均值
+        clipped_mean = torch.clamp(mean_raw, con_mask_bounds[:, 0], con_mask_bounds[:, 1])
+        # 使用裁剪后的均值创建分布
+        dist_con = Normal(clipped_mean, std)
+        # 计算缓冲区中的动作 (act_con) 在这个分布下的对数概率
+        # 注意：缓冲区中的 act_con 已经被 select_action 裁剪过，所以它一定在分布的支持域内
         logprobs_con = dist_con.log_prob(action_con).sum(dim=-1)
         dist_entropy_con = dist_con.entropy().sum(dim=-1)
 
@@ -423,48 +454,95 @@ class PPO_Hybrid(PPO_Abstract, ABC):
 
     def select_action(self, state, action_mask):
         with torch.no_grad():
-            # 假设state已经是扁平化的numpy数组
+            # 1. 准备输入：将扁平化的状态向量还原为网络需要的结构化输入
             map_input, sensor_data = self._prepare_inputs(torch.FloatTensor(state).unsqueeze(0).to(self.device))
 
-            # action_mask也需要是tensor
-            mask_dict_tensor = {
-                'discrete_mask': torch.FloatTensor(action_mask['discrete_mask']).to(self.device).unsqueeze(0),
-                'continuous_mask': torch.FloatTensor(action_mask['continuous_mask']).to(self.device).unsqueeze(0)
-            }
+            # 2. 共享前向传播：通过共享的主体网络获取融合后的特征向量
+            #    这个特征向量将被 actor 和 critic 的头部共同使用
+            fused_vector = self.agent_old._forward_body(map_input, sensor_data)
 
-            state_value, action_dis, action_con_raw, log_prob_dis, log_prob_con = self.agent_old.act(map_input, sensor_data,
-                                                                                                 mask_dict_tensor)
+            # -----------------------------------------------------------------
+            # 3. 处理连续动作 (这是关键修正部分)
+            # -----------------------------------------------------------------
+            # a. 从头部网络获取原始的动作分布均值
+            mean_raw = self.agent_old.actor_con_head(fused_vector)
+            # 获取动作分布的标准差
+            std = torch.exp(self.agent_old.log_std)
 
-            # 1. 获取掩码边界 (numpy格式)
-            con_mask_bounds = action_mask['continuous_mask']
+            # b. 将 NumPy 格式的掩码转换为 PyTorch Tensor
+            con_mask_bounds = torch.FloatTensor(action_mask['continuous_mask']).to(self.device)
 
-            # 2. 将PyTorch Tensor转为Numpy，以便使用 np.clip
-            action_con_raw_np = action_con_raw.squeeze().cpu().numpy()
+            # c. 【核心修正】在创建分布之前，先将“均值”裁剪到掩码定义的有效范围内
+            clipped_mean = torch.clamp(mean_raw, con_mask_bounds[:, 0], con_mask_bounds[:, 1])
 
-            # 3. 裁剪动作到掩码定义的范围
-            # 注意：action_con_raw_np 是 [-1, 1] 范围的，mask 也是 [-1, 1] 范围的
-            action_con_clipped = np.clip(
-                action_con_raw_np,
-                con_mask_bounds[:, 0],  # low bounds
-                con_mask_bounds[:, 1]  # high bounds
+            # d. 使用“裁剪后的均值”来创建正态分布，这使得采样更稳定
+            dist_con = Normal(clipped_mean, std)
+
+            # e. 从这个更安全的分布中采样一个动作
+            action_con = dist_con.sample()
+
+            # f. 作为最后的保险措施，再次裁剪采样出的动作，确保它绝对不会因为标准差而越界
+            action_con_final = torch.clamp(action_con, con_mask_bounds[:, 0], con_mask_bounds[:, 1])
+
+            # g. 【核心修正】计算“最终被执行的动作”的对数概率
+            #    这保证了策略梯度更新的一致性
+            log_prob_con = dist_con.log_prob(action_con_final).sum(dim=-1)
+
+            # -----------------------------------------------------------------
+            # 4. 处理离散动作 (这部分逻辑通常是正确的，保持完整)
+            # -----------------------------------------------------------------
+            # a. 从头部网络获取离散动作的原始 logits
+            action_logits = self.agent_old.actor_dis_head(fused_vector).view(
+                -1,
+                self.agent_old.action_dis_dim,  # <-- 从 self.agent_old 获取
+                self.agent_old.action_dis_len  # <-- 从 self.agent_old 获取
             )
 
-            # 返回裁剪后的连续动作
+            # b. 准备离散动作的掩码张量
+            discrete_mask_tensor = torch.FloatTensor(action_mask['discrete_mask']).to(self.device).view(
+                -1,
+                self.agent_old.action_dis_dim,  # <-- 从 self.agent_old 获取
+                self.agent_old.action_dis_len  # <-- 从 self.agent_old 获取
+            )
+
+            # c. 将掩码应用到 logits 上（将无效动作的概率设置为极小值）
+            masked_logits = action_logits.masked_fill(discrete_mask_tensor == 0, -1e9)
+
+            # d. 创建分类分布
+            dist_dis = Categorical(logits=masked_logits)
+
+            # e. 采样离散动作并计算其对数概率
+            action_dis = dist_dis.sample()
+            logprob_dis = dist_dis.log_prob(action_dis).sum(dim=-1)
+
+            # -----------------------------------------------------------------
+            # 5. 获取评价值
+            # -----------------------------------------------------------------
+            # 从 critic 头部网络获取当前状态的评价值 V(s)
+            state_value = self.agent_old.critic_head(fused_vector)
+
+            # -----------------------------------------------------------------
+            # 6. 准备并返回所有结果
+            # -----------------------------------------------------------------
+            # 将所有 PyTorch Tensor 转换回 NumPy 数组，并调整形状以供环境和 Buffer 使用
         return (state_value.squeeze().cpu().numpy(),
-                (action_dis.squeeze().cpu().numpy(), action_con_clipped),  # <--- 返回裁剪后的动作
-                (log_prob_dis.squeeze().cpu().numpy(), log_prob_con.squeeze().cpu().numpy()))
+                (action_dis.squeeze().cpu().numpy(), action_con_final.squeeze().cpu().numpy()),  # 返回最终的、修正后的连续动作
+                (logprob_dis.squeeze().cpu().numpy(), log_prob_con.squeeze().cpu().numpy()))
 
 
     def compute_loss_pi(self, data):
-        obs, action_mask_flat, act_dis, act_con, adv, _, logp_old_dis, logp_old_con = data
+        # 解包数据，现在多了 action_mask_con
+        obs, action_mask_dis_flat, action_mask_con, act_dis, act_con, adv, _, logp_old_dis, logp_old_con = data
 
         map_input, sensor_data = self._prepare_inputs(obs)
 
+        # 从解包的数据中重建掩码字典
         action_mask_dict = {
-            'discrete_mask': action_mask_flat.view(-1, self.action_dis_dim, self.action_dis_len),
-            'continuous_mask': torch.ones_like(act_con)  # 假设连续动作总是可用
+            'discrete_mask': action_mask_dis_flat.view(-1, self.action_dis_dim, self.action_dis_len),
+            'continuous_mask': action_mask_con  # <-- 使用从buffer来的真实掩码！
         }
 
+        # get_logprob_entropy也需要修正
         logp_dis, logp_con, dist_entropy_dis, dist_entropy_con = self.agent.get_logprob_entropy(
             map_input, sensor_data, act_dis, act_con, action_mask_dict
         )
@@ -486,7 +564,8 @@ class PPO_Hybrid(PPO_Abstract, ABC):
         return loss_pi_dis, loss_pi_con, approx_kl_dis, approx_kl_con
 
     def compute_loss_v(self, data):
-        obs, _, _, _, _, ret, _, _ = data
+        obs, _, _, _, _, _, ret, _, _ = data
+        # obs, _, _, _, _, ret, _, _ = data
         map_input, sensor_data = self._prepare_inputs(obs)
         state_values = self.agent.get_value(map_input, sensor_data)
         return self.loss_func(state_values, ret.unsqueeze(1))
@@ -502,4 +581,52 @@ class PPO_Hybrid(PPO_Abstract, ABC):
         #     for data in sampler:
         #         # 您的优化器更新逻辑
         # ...
-        pass
+        pi_losses_dis, pi_losses_con, v_losses, kl_dis_all, kl_con_all = [], [], [], [], []
+
+        for i in range(self.epochs_update):
+            sampler = self.buffer.get(batch_size)
+            for data in sampler:
+                # 计算 Actor 损失
+                loss_pi_dis, loss_pi_con, approx_kl_dis, approx_kl_con = self.compute_loss_pi(data)
+
+                # KL 散度早停
+                if self.target_kl_dis is not None and approx_kl_dis > 1.5 * self.target_kl_dis:
+                    print(f"Early stopping at epoch {i} due to high KL divergence for discrete actions.")
+                    break
+                if self.target_kl_con is not None and approx_kl_con > 1.5 * self.target_kl_con:
+                    print(f"Early stopping at epoch {i} due to high KL divergence for continuous actions.")
+                    break
+
+                # 优化离散动作 Actor
+                self.optimizer_actor_dis.zero_grad()
+                loss_pi_dis.backward()
+                nn.utils.clip_grad_norm_(self.agent.actor_dis_head.parameters(), self.max_norm)
+                self.optimizer_actor_dis.step()
+
+                # 优化连续动作 Actor
+                self.optimizer_actor_con.zero_grad()
+                loss_pi_con.backward()
+                nn.utils.clip_grad_norm_(self.agent.actor_con_head.parameters(), self.max_norm)
+                self.optimizer_actor_con.step()
+
+                # 计算 Critic 损失并优化
+                loss_v = self.compute_loss_v(data)
+                self.optimizer_critic.zero_grad()
+                loss_v.backward()
+                nn.utils.clip_grad_norm_(self.agent.critic_head.parameters(), self.max_norm)
+                self.optimizer_critic.step()
+
+                # 记录损失和KL
+                pi_losses_dis.append(loss_pi_dis.item())
+                pi_losses_con.append(loss_pi_con.item())
+                v_losses.append(loss_v.item())
+                kl_dis_all.append(approx_kl_dis)
+                kl_con_all.append(approx_kl_con)
+
+        # 更新旧策略网络
+        self.agent_old.load_state_dict(self.agent.state_dict())
+
+        # 学习率衰减
+        self.lr_scheduler_actor_dis.step()
+        self.lr_scheduler_actor_con.step()
+        self.lr_scheduler_critic.step()
