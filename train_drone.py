@@ -99,7 +99,7 @@ def train():
     os.makedirs("./models", exist_ok=True)
 
     # --- 4. 训练循环 ---
-    max_train_episodes = 2001  # 训练5000个回合 5000→500→3000→2000
+    max_train_episodes = 1001  # 训练5000个回合 5000→500→3000→2000
 
     all_episode_rewards = []  # 用于存储每个episode的总奖励
     for episode in range(max_train_episodes):

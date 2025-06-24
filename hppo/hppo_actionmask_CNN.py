@@ -143,10 +143,11 @@ class PPOBuffer:
 
     def get(self, batch_size):
         obs_buf = self.obs_buf[:self.ptr]
-        action_mask_buf = self.action_mask_buf[:self.ptr]
 
-        action_mask_dis_buf = self.action_mask_dis_buf[:self.ptr]
+        # --- 关键修正：使用新的属性名 ---
+        action_mask_dis_buf = self.action_mask_dis_buf[:self.ptr]  # <-- 之前这里是错误的 self.action_mask_buf
         action_mask_con_buf = self.action_mask_con_buf[:self.ptr]
+        # --- 修正结束 ---
 
         act_dis_buf = self.act_dis_buf[:self.ptr]
         act_con_buf = self.act_con_buf[:self.ptr]
@@ -166,13 +167,13 @@ class PPOBuffer:
 
         for indices in sampler:
             yield (
+                torch.as_tensor(obs_buf[indices], dtype=torch.float32, device=self.device),
 
-                # 将两个掩码都传递出去
+                # --- 关键修正：确保 yield 的数据与 PPO_Hybrid.compute_loss_pi 的解包匹配 ---
                 torch.as_tensor(action_mask_dis_buf[indices], dtype=torch.float32, device=self.device),
                 torch.as_tensor(action_mask_con_buf[indices], dtype=torch.float32, device=self.device),
+                # --- 修正结束 ---
 
-                torch.as_tensor(obs_buf[indices], dtype=torch.float32, device=self.device),
-                torch.as_tensor(action_mask_buf[indices], dtype=torch.float32, device=self.device),
                 torch.as_tensor(act_dis_buf[indices], dtype=torch.int64, device=self.device),
                 torch.as_tensor(act_con_buf[indices], dtype=torch.float32, device=self.device),
                 torch.as_tensor(adv_buf[indices], dtype=torch.float32, device=self.device),
@@ -392,6 +393,9 @@ class PPO_Hybrid(PPO_Abstract, ABC):
         self.IMG_W = img_w
         self.NUM_SENSORS = num_sensors
         self.SENSOR_DIM = sensor_dim
+
+        self.action_dis_dim = action_dis_dim
+        self.action_dis_len = action_dis_len
         # --- 关键修改 2：子类负责自己的所有具体实现 ---
         self.target_kl_dis = target_kl_dis
         self.target_kl_con = target_kl_con
@@ -623,10 +627,11 @@ class PPO_Hybrid(PPO_Abstract, ABC):
                 kl_dis_all.append(approx_kl_dis)
                 kl_con_all.append(approx_kl_con)
 
-        # 更新旧策略网络
-        self.agent_old.load_state_dict(self.agent.state_dict())
 
-        # 学习率衰减
+        # 在所有优化步骤完成后，但在更新旧策略网络之前，更新学习率
         self.lr_scheduler_actor_dis.step()
         self.lr_scheduler_actor_con.step()
         self.lr_scheduler_critic.step()
+
+        # 更新旧策略网络
+        self.agent_old.load_state_dict(self.agent.state_dict())
