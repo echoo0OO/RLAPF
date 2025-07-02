@@ -21,6 +21,14 @@ class DroneNavigationEnv(gym.Env):
     def __init__(self, config):
         super().__init__()
         # --- 环境和模型参数 ---
+
+        # 机制2: 硬稳定 (用于全局屏蔽)
+        self.hard_stable_threshold = 3
+        self.hard_radius_change_threshold = 0.5
+        self.is_sensor_hard_stable = np.full(self.num_sensors, False, dtype=bool)
+        self.radius_stable_counters_hard = np.zeros(self.num_sensors, dtype=int)
+        # ----------------------------
+
         self.num_sensors = config.get("num_sensors", 5)
         self.area_size = config.get("area_size", (1000.0, 1000.0))
         self.solo_SN_data = config.get("solo_SN_data", 2e7)
@@ -75,6 +83,16 @@ class DroneNavigationEnv(gym.Env):
         # 【新增】用于在 _calculate_reward 内部比较的状态属性
         self.last_dist_to_closest_target = None
         self.radii_before_action = None
+
+        # 【新增】传感器级别的稳定状态标志
+        self.is_sensor_stable = np.full(self.num_sensors, False, dtype=bool)
+
+        # --- 新的双重稳定状态追踪 ---
+        # 机制1: 软稳定 (用于引导通信)
+        self.soft_stable_threshold = 3
+        self.soft_radius_change_threshold = 1.0
+        self.is_sensor_soft_stable = np.full(self.num_sensors, False, dtype=bool)
+        self.radius_stable_counters_soft = np.zeros(self.num_sensors, dtype=int)
 
         # --- 日志 ---
         self.trajectory, self.communication_log, self.localization_log = [], [], []
@@ -146,8 +164,68 @@ class DroneNavigationEnv(gym.Env):
     def _get_info(self):
         return {"steps": self.current_step, "current_mode": self.current_mode}
 
+    def _get_action_mask(self):
+        """
+        【全新完整实现】计算当前步的高级动态动作掩码。
+        """
+        # --- 1. 离散动作掩码 ---
+        mask_discrete = np.ones((1, 2), dtype=np.int8)  # 默认都允许 [通信, 定位]
+
+        # 检查所有需要收集数据的传感器
+        unfinished_mask = self.sensor_data_amounts > 0
+
+        # 如果没有任何需要收集数据的传感器，则禁止定位
+        if not np.any(unfinished_mask):
+            mask_discrete[0, 1] = 0
+        else:
+            # 获取所有未完成任务的传感器的硬稳定状态
+            hard_stable_status_of_unfinished = self.is_sensor_hard_stable[unfinished_mask]
+
+            # **全局硬屏蔽逻辑**: 如果所有未完成的传感器都已达到硬稳定，则禁止“定位”
+            if np.all(hard_stable_status_of_unfinished):
+                mask_discrete[0, 1] = 0
+
+        # --- 2. 连续动作掩码 ---
+        mask_continuous = np.array([[-1.0, 1.0], [-1.0, 1.0]], dtype=np.float32)  # 默认全范围
+
+        # **通信时方向限制逻辑**:
+        # 这个逻辑应该只在“智能体将要执行通信”这个前提下应用。
+        # 我们可以在 _get_obs 时就计算好，智能体在选择动作时会看到这个限制。
+        if self._is_in_comm_range():
+            est_pos = self.uncertainty_model.estimated_positions
+            distances = np.linalg.norm(self.drone_position - est_pos, axis=1)
+            # 只考虑需要通信的目标
+            distances[~unfinished_mask] = np.inf
+
+            if not np.all(np.isinf(distances)):
+                target_idx = np.argmin(distances)
+                target_vec = est_pos[target_idx] - self.drone_position
+                target_angle = np.arctan2(target_vec[1], target_vec[0])
+
+                angle_allowance = np.pi / 6.0  # 30度
+                min_angle = target_angle - angle_allowance
+                max_angle = target_angle + angle_allowance
+
+                # 归一化到 [-1, 1]
+                low_b, high_b = self.real_action_bounds['direction']['low'], self.real_action_bounds['direction'][
+                    'high']
+                norm_min = (min_angle - low_b) / (high_b - low_b) * 2 - 1
+                norm_max = (max_angle - low_b) / (high_b - low_b) * 2 - 1
+
+                mask_continuous[0, 0] = np.clip(norm_min, -1.0, 1.0)
+                mask_continuous[0, 1] = np.clip(norm_max, -1.0, 1.0)
+
+        return mask_discrete, mask_continuous
+
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
+
+        # 重置所有稳定性相关的状态
+        self.is_sensor_soft_stable.fill(False)
+        self.radius_stable_counters_soft.fill(0)
+        self.is_sensor_hard_stable.fill(False)
+        self.radius_stable_counters_hard.fill(0)
+
         self.trajectory, self.communication_log, self.localization_log = [], [], []
         self.current_step = 0
 
@@ -222,12 +300,18 @@ class DroneNavigationEnv(gym.Env):
             self.current_mode = 'DECIDING'
 
     def _execute_maneuver_policy(self):
+        # --- 1. 递减步数并检查是否用尽 ---
+        self.maneuver_steps_left -= 1
+        target_id = self.maneuver_target_sensor_id
+        if self.is_sensor_soft_stable[target_id] or self.maneuver_steps_left < 0 or self.maneuver_target_sensor_id == -1:
+            self.current_mode = 'DECIDING'
+            return
         target_pos = self.uncertainty_model.estimated_positions[self.maneuver_target_sensor_id]
         vec_to_uav = self.drone_position - target_pos
         tangent_vec = np.array([-vec_to_uav[1], vec_to_uav[0]])
         norm_tangent = tangent_vec / (np.linalg.norm(tangent_vec) + 1e-6)
 
-        real_speed = 20.0
+        real_speed = 30.0
         real_direction = np.arctan2(norm_tangent[1], norm_tangent[0])
         self.drone_velocity = np.array([real_speed * np.cos(real_direction), real_speed * np.sin(real_direction)])
         self.drone_position += self.drone_velocity * self.time_slot
@@ -235,9 +319,6 @@ class DroneNavigationEnv(gym.Env):
 
         self._execute_localization()
 
-        self.maneuver_steps_left -= 1
-        if self.maneuver_steps_left <= 0:
-            self.current_mode = 'DECIDING'
 
     def _execute_communication(self):
         est_pos = self.uncertainty_model.estimated_positions
@@ -289,14 +370,42 @@ class DroneNavigationEnv(gym.Env):
                 measurement_variance=variances[i]
             )
 
+        changes = np.abs(self.radii_before_action - self.uncertainty_model.uncertainty_radii.copy())
+        for i in range(self.num_sensors):
+            # 更新软稳定
+            if changes[i] < self.soft_radius_change_threshold:
+                self.radius_stable_counters_soft[i] += 1
+            else:
+                self.radius_stable_counters_soft[i] = 0
+                self.is_sensor_soft_stable[i] = False
+            if self.radius_stable_counters_soft[i] >= self.soft_stable_threshold:
+                self.is_sensor_soft_stable[i] = True
+
+            # 更新硬稳定
+            if changes[i] < self.hard_radius_change_threshold:
+                self.radius_stable_counters_hard[i] += 1
+            else:
+                self.radius_stable_counters_hard[i] = 0
+                self.is_sensor_hard_stable[i] = False
+            if self.radius_stable_counters_hard[i] >= self.hard_stable_threshold:
+                self.is_sensor_hard_stable[i] = True
+
         self.localization_log.append({
             'step': self.current_step,
             'est_positions': self.uncertainty_model.estimated_positions.copy(),
             'est_radii': self.uncertainty_model.uncertainty_radii.copy()
         })
 
+
     def step(self, action):
         self.current_step += 1
+
+        # 核心逻辑：如果一个传感器的数据被采集完了，那么它就不再是“软稳定”状态，
+        # 因为我们不再关心它的临时稳定性了。这为下一轮可能的任务做准备。
+        # 硬稳定状态一旦达成，则保持不变。
+        data_finished_mask = self.sensor_data_amounts <= 1e-3
+        self.is_sensor_soft_stable[data_finished_mask] = False
+        self.radius_stable_counters_soft[data_finished_mask] = 0
 
         # 【核心修改】在执行任何动作之前，记录状态快照
         self.radii_before_action = self.uncertainty_model.uncertainty_radii.copy()
@@ -331,7 +440,9 @@ class DroneNavigationEnv(gym.Env):
                     distances[~eligible_mask] = np.inf
                     self.maneuver_target_sensor_id = np.argmin(distances)
                 else:
-                    self.maneuver_target_sensor_id = 0
+                    self.maneuver_target_sensor_id = -1
+
+
 
         # --- 奖励计算 ---
         # 现在，所有计算都在这个函数内部完成

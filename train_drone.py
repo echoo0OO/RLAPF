@@ -67,8 +67,11 @@ def train():
             # 检查当前是否为决策模式
             is_deciding_mode = info.get('current_mode') == 'DECIDING'
 
+            mask_d, mask_c = env._get_action_mask()
+            action_mask = {"discrete_mask": mask_d, "continuous_mask": mask_c}
+
             # 智能体选择动作
-            action_mask = {"discrete_mask": np.ones((1, 2)), "continuous_mask": np.array([[-1.0, 1.0]] * 2)}
+            # action_mask = {"discrete_mask": np.ones((1, 2)), "continuous_mask": np.array([[-1.0, 1.0]] * 2)}
             value, (action_dis, action_con), (logp_dis, logp_con) = agent.select_action(flat_obs, action_mask)
             action_dict = {"discrete": action_dis, "continuous": action_con}
 
