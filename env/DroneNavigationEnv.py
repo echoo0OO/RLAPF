@@ -7,7 +7,7 @@ import numpy as np
 
 from env.env_utils import poisson_disk_sampling
 from env.uncertain_model import UncertaintyModel
-
+from env.maneuver_controllers import SpiralManeuverController
 
 class DroneNavigationEnv(gym.Env):
     """
@@ -22,16 +22,11 @@ class DroneNavigationEnv(gym.Env):
         super().__init__()
         # --- 环境和模型参数 ---
 
-        # 机制2: 硬稳定 (用于全局屏蔽)
-        self.hard_stable_threshold = 3
-        self.hard_radius_change_threshold = 0.5
-        self.is_sensor_hard_stable = np.full(self.num_sensors, False, dtype=bool)
-        self.radius_stable_counters_hard = np.zeros(self.num_sensors, dtype=int)
-        # ----------------------------
+        self.maneuver_reward_bonus = 30.0  # 可以调整这个值
 
         self.num_sensors = config.get("num_sensors", 5)
         self.area_size = config.get("area_size", (1000.0, 1000.0))
-        self.solo_SN_data = config.get("solo_SN_data", 2e7)
+        self.solo_SN_data = config.get("solo_SN_data", 6e7)
         self.max_steps_per_episode = config.get("max_steps_per_episode", 500)
         self.MANEUVER_TOTAL_STEPS = 5
 
@@ -87,13 +82,25 @@ class DroneNavigationEnv(gym.Env):
         # 【新增】传感器级别的稳定状态标志
         self.is_sensor_stable = np.full(self.num_sensors, False, dtype=bool)
 
+        self.spiral_controller = SpiralManeuverController(
+            total_speed=20.0,
+            start_radius=150.0,  # 可调参数
+            min_radius=20.0,  # 可调参数
+            time_slot=self.time_slot
+        )
+
         # --- 新的双重稳定状态追踪 ---
         # 机制1: 软稳定 (用于引导通信)
         self.soft_stable_threshold = 3
         self.soft_radius_change_threshold = 1.0
         self.is_sensor_soft_stable = np.full(self.num_sensors, False, dtype=bool)
         self.radius_stable_counters_soft = np.zeros(self.num_sensors, dtype=int)
-
+        # 机制2: 硬稳定 (用于全局屏蔽)
+        self.hard_stable_threshold = 5
+        self.hard_radius_change_threshold = 0.5
+        self.is_sensor_hard_stable = np.full(self.num_sensors, False, dtype=bool)
+        self.radius_stable_counters_hard = np.zeros(self.num_sensors, dtype=int)
+        # ----------------------------
         # --- 日志 ---
         self.trajectory, self.communication_log, self.localization_log = [], [], []
         self.trajectory_save_freq = 5
@@ -269,7 +276,8 @@ class DroneNavigationEnv(gym.Env):
 
         for idx in np.where(eligible_mask)[0]:
             dist_center = np.linalg.norm(self.drone_position - est_pos[idx])
-            worst_h_dist = dist_center + est_radii[idx]
+            radii = min(est_radii[idx], 100)
+            worst_h_dist = dist_center + radii
             worst_3d_dist = np.sqrt(worst_h_dist ** 2 + self.drone_height ** 2) + 1e-6
             path_loss = (1 / worst_3d_dist) ** self.path_loss_exponent
             rx_power_est = gain_const * path_loss
@@ -295,61 +303,104 @@ class DroneNavigationEnv(gym.Env):
 
         self.drone_position += self.drone_velocity * self.time_slot
         self.drone_position = np.clip(self.drone_position, [0, 0], self.area_size)
-
         if self._is_in_comm_range():
             self.current_mode = 'DECIDING'
 
     def _execute_maneuver_policy(self):
-        # --- 1. 递减步数并检查是否用尽 ---
-        self.maneuver_steps_left -= 1
         target_id = self.maneuver_target_sensor_id
-        if self.is_sensor_soft_stable[target_id] or self.maneuver_steps_left < 0 or self.maneuver_target_sensor_id == -1:
+        # =================== 补丁 2 开始 ===================
+        # 检查目标ID是否有效，以及机动步数是否用尽
+        if target_id == -1 or self.maneuver_steps_left < 0:
+            self.current_mode = 'DECIDING'
+            return False
+
+        # 新的“软稳定”判断：即使目标稳定，也允许至少执行一步机动。
+        # 只有在第二次及以后进入时，才检查软稳定状态。
+        is_stable = self.is_sensor_soft_stable[target_id]
+        if is_stable and self.maneuver_steps_left < self.MANEUVER_TOTAL_STEPS - 1:
+            self.current_mode = 'DECIDING'
+            return False
+        # =================== 补丁 2 结束 ===================
+        # --- 1. 递减步数 ---
+        self.maneuver_steps_left -= 1
+        target_pos = self.uncertainty_model.estimated_positions[target_id]
+
+        # 调用螺旋控制器计算移动向量
+        move_vector = self.spiral_controller.calculate_move_vector(
+            self.drone_position, target_pos
+        )
+
+        # 如果控制器返回零向量（表示已完成），则切换模式
+        if np.linalg.norm(move_vector) < 1e-6:
             self.current_mode = 'DECIDING'
             return
-        target_pos = self.uncertainty_model.estimated_positions[self.maneuver_target_sensor_id]
-        vec_to_uav = self.drone_position - target_pos
-        tangent_vec = np.array([-vec_to_uav[1], vec_to_uav[0]])
-        norm_tangent = tangent_vec / (np.linalg.norm(tangent_vec) + 1e-6)
 
-        real_speed = 30.0
-        real_direction = np.arctan2(norm_tangent[1], norm_tangent[0])
-        self.drone_velocity = np.array([real_speed * np.cos(real_direction), real_speed * np.sin(real_direction)])
-        self.drone_position += self.drone_velocity * self.time_slot
+        # 更新无人机位置和速度
+        self.drone_position += move_vector
+        self.drone_velocity = move_vector / self.time_slot
         self.drone_position = np.clip(self.drone_position, [0, 0], self.area_size)
 
         self._execute_localization()
-
+        return True
 
     def _execute_communication(self):
+        """
+            【优化版】
+            - 移除了多余的SNR判断。
+            - 明确了“只与最近的可通信目标”通信的逻辑。
+            """
         est_pos = self.uncertainty_model.estimated_positions
         est_radii = self.uncertainty_model.uncertainty_radii
         eligible_mask = self.sensor_data_amounts > 0
-        if not np.any(eligible_mask): return
 
+        if not np.any(eligible_mask):
+            return  # 如果没有需要通信的目标，直接返回
+
+        # --- 核心修改部分 ---
+
+        # 1. 计算到所有有效目标的最坏情况3D距离
         dist_to_center = np.linalg.norm(self.drone_position - est_pos, axis=1)
         max_h_dist = dist_to_center + est_radii
         max_3d_dist = np.sqrt(max_h_dist ** 2 + self.drone_height ** 2)
 
+        # 2. 将无效目标（数据已采完）的距离设为无穷大
         dist_to_consider = np.where(eligible_mask, max_3d_dist, np.inf)
+
+        # 3. 如果不存在任何有效目标，则返回
+        if np.all(np.isinf(dist_to_consider)):
+            return
+
+        # 4. 找到距离最近的有效目标
         target_idx = np.argmin(dist_to_consider)
 
+        # 5. 【移除冗余判断】
+        # 我们在这里假设，既然被允许执行通信，那么这个最近的目标一定是可通信的。
+        # 因此，直接计算实际的吞吐量并传输数据。
+        # 之前的 if snr_est_lin >= self.snr_threshold_linear: 判断被移除。
+
+        # 计算真实SNR和吞吐量
         ref_gain_lin = 10 ** (self.reference_loss / 10)
-        path_loss_est = ref_gain_lin * (
-                    self.reference_distance / (max_3d_dist[target_idx] + 1e-6)) ** self.path_loss_exponent
-        snr_est_lin = (self.transmit_power * path_loss_est) / self.noise_power
+        true_h_dist = np.linalg.norm(self.drone_position - self.sensor_true_positions[target_idx])
+        true_3d_dist = np.sqrt(true_h_dist ** 2 + self.drone_height ** 2)
 
-        transmitted_data, snr_lin = 0.0, 0.0
-        # 这里也需要使用线性阈值
-        if snr_est_lin >= self.snr_threshold_linear:
-            true_h_dist = np.linalg.norm(self.drone_position - self.sensor_true_positions[target_idx])
-            true_3d_dist = np.sqrt(true_h_dist ** 2 + self.drone_height ** 2)
-            path_loss_true = ref_gain_lin * (self.reference_distance / (true_3d_dist + 1e-6)) ** self.path_loss_exponent
-            snr_lin = (self.transmit_power * path_loss_true) / self.noise_power
-            throughput = self.bandwidth * np.log2(1 + snr_lin)
-            transmitted_data = throughput * self.time_slot
+        # 防止除以零
+        if true_3d_dist < 1e-6: true_3d_dist = 1e-6
 
+        path_loss_true = ref_gain_lin * (self.reference_distance / true_3d_dist) ** self.path_loss_exponent
+        snr_lin = (self.transmit_power * path_loss_true) / self.noise_power
+
+        # 注意：如果SNR低于某个极小值，log2(1+snr)可能为负或0，导致无数据传输，这是正常的。
+        throughput = self.bandwidth * np.log2(1 + snr_lin)
+        transmitted_data = throughput * self.time_slot
+
+        # 确保传输数据不为负
+        if transmitted_data < 0:
+            transmitted_data = 0.0
+
+        # 更新数据量
         self.sensor_data_amounts[target_idx] = max(0, self.sensor_data_amounts[target_idx] - transmitted_data)
 
+        # 记录日志
         self.communication_log.append({
             'step': self.current_step, 'target_sensor': target_idx,
             'transmitted_data_Mbits': transmitted_data / 1e6,
@@ -400,6 +451,9 @@ class DroneNavigationEnv(gym.Env):
     def step(self, action):
         self.current_step += 1
 
+        # 定义一个变量来捕获本次step是否执行了有效机动
+        maneuver_executed_successfully = False
+
         # 核心逻辑：如果一个传感器的数据被采集完了，那么它就不再是“软稳定”状态，
         # 因为我们不再关心它的临时稳定性了。这为下一轮可能的任务做准备。
         # 硬稳定状态一旦达成，则保持不变。
@@ -431,8 +485,22 @@ class DroneNavigationEnv(gym.Env):
             if discrete_action == 0:
                 self._execute_communication()
             elif discrete_action == 1:
+
+                eligible_mask = self.sensor_data_amounts > 0
+                if np.any(eligible_mask):
+                    # 计算到所有未完成任务的传感器的距离
+                    distances = np.linalg.norm(self.drone_position - self.uncertainty_model.estimated_positions, axis=1)
+                    distances[~eligible_mask] = np.inf  # 屏蔽已完成的
+                    self.maneuver_target_sensor_id = np.argmin(distances)
+                else:
+                    # 如果没有目标了，则设为-1，机动会立即退出
+                    self.maneuver_target_sensor_id = -1
+
+                # 2. 然后再切换模式并设置步数
                 self.current_mode = 'EXECUTING_MANEUVER'
                 self.maneuver_steps_left = self.MANEUVER_TOTAL_STEPS
+
+                maneuver_executed_successfully = self._execute_maneuver_policy()
 
                 eligible_mask = self.sensor_data_amounts > 0
                 if np.any(eligible_mask):
@@ -447,6 +515,8 @@ class DroneNavigationEnv(gym.Env):
         # --- 奖励计算 ---
         # 现在，所有计算都在这个函数内部完成
         reward = self._calculate_reward()
+        if maneuver_executed_successfully:
+            reward += self.maneuver_reward_bonus
         # --- 公共逻辑 (轨迹记录, 终止判断) ---
         if self.current_step % self.trajectory_save_freq == 0:
             self.trajectory.append(self.drone_position.copy())

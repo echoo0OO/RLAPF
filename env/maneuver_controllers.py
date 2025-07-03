@@ -99,7 +99,7 @@ if __name__ == "__main__":
 
 
     # --- 场景和控制器参数设定 ---
-    SIM_TOTAL_SPEED = 30.0
+    SIM_TOTAL_SPEED = 20.0
     SIM_START_RADIUS = 100.0
     SIM_MIN_RADIUS = 0.0
     SIM_TIME_SLOT = 1.0
@@ -123,7 +123,7 @@ if __name__ == "__main__":
     ranging_points = [drone_pos.copy()]
     gdop_history = [calculate_gdop(ranging_points, sensor_est_pos)]
 
-    max_steps = 100  # 防止无限循环
+    max_steps = 5  # 防止无限循环
     for step in range(max_steps):
         # 核心：调用控制器计算下一步移动
         move_vector = controller.calculate_move_vector(drone_pos, sensor_est_pos)
