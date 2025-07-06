@@ -34,7 +34,7 @@ def train():
 
     # 日志、绘图和保存的超参数
     log_interval = 1
-    plot_interval = 50
+    plot_interval = 20
     save_interval = 100
 
     # --- 2. 初始化环境和智能体 ---

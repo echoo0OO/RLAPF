@@ -25,7 +25,7 @@ class UncertaintyModel:
         self.estimated_positions = np.zeros((num_sensors, 2))
         self.covariance_matrices = np.array([np.eye(2) * 100 ** 2 for _ in range(num_sensors)])
         self.uncertainty_radii = np.full(num_sensors, 100.0)
-        q_val = 1e-5
+        q_val = 1e-2
         self.process_noise_q = np.eye(2) * q_val
         self.ranging_points = [[] for _ in range(num_sensors)]
 
@@ -43,6 +43,42 @@ class UncertaintyModel:
         self.covariance_matrices = np.array([np.eye(2) * initial_radius ** 2 for _ in range(self.num_sensors)])
         self.uncertainty_radii = np.full(self.num_sensors, initial_radius)
         self.ranging_points = [[] for _ in range(self.num_sensors)]
+
+    def add_ranging_point(self, sensor_id: int, drone_position: np.ndarray):
+        """
+        只向指定传感器的历史记录中添加一个新的测距点（无人机位置）。
+        """
+        self.ranging_points[sensor_id].append(drone_position)
+        # 保持历史记录的长度，防止无限增长
+        if len(self.ranging_points[sensor_id]) > 50:
+            self.ranging_points[sensor_id].pop(0)
+
+    def get_sector_coverage(self, sensor_id: int, num_sectors: int = 12) -> int:
+        """
+        计算一个传感器的历史点覆盖了多少个不同的扇区。
+
+        Args:
+            sensor_id (int): 传感器的ID。
+            num_sectors (int): 总的扇区数量。
+
+        Returns:
+            int: 被覆盖的扇区的数量。
+        """
+        history_points = self.ranging_points[sensor_id]
+        if len(history_points) < 1:
+            return 0
+
+        sensor_pos = self.estimated_positions[sensor_id]
+        vectors = np.array(history_points) - sensor_pos
+        angles = np.arctan2(vectors[:, 1], vectors[:, 0])
+        sector_width = 2 * np.pi / num_sectors
+        sector_indices = np.floor((angles + np.pi) / sector_width).astype(int)
+        sector_indices = np.clip(sector_indices, 0, num_sectors - 1)
+
+        # 使用np.unique找到所有出现过的扇区索引，然后计算其数量
+        num_covered_sectors = len(np.unique(sector_indices))
+
+        return num_covered_sectors
 
     def _select_points_for_gdop(self, sensor_id: int, num_sectors: int = 12) -> List[np.ndarray]:
         """
@@ -125,10 +161,6 @@ class UncertaintyModel:
         """
         # --- 0. 计算动态步长 eta ---
         # 首先加入新的测距点，然后计算GDOP
-        self.ranging_points[sensor_id].append(drone_position)
-        if len(self.ranging_points[sensor_id]) > 50:
-            self.ranging_points[sensor_id].pop(0)
-
         current_gdop = self.calculate_current_gdop(sensor_id)
         # 根据论文公式 η = GDOP_k / GDOP_sup
         step_size_eta = min(current_gdop / self.gdop_sup, 1.0)  # 归一化并限制最大为1

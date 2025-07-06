@@ -69,85 +69,45 @@ class ManifoldFilterModel:
         self.uncertainty_radii = np.full(self.num_sensors, initial_radius)
 
     def g_mgf_update(self, sensor_id: int, drone_position: np.ndarray,
-                     measured_distance: float, measurement_variance: float, step_size_eta: float = 1.0):
-        """
-        Performs a single G-MGF (GDOP-Assisted Manifold Gradient Filtering) update step.
-        This is the core implementation of the algorithm from the paper.
-
-        Args:
-            sensor_id: The ID of the sensor to update.
-            drone_position: The 2D position of the UAV making the measurement.
-            measured_distance: The measured range from the UAV to the sensor.
-            measurement_variance: The variance (R) of the ranging measurement noise.
-            step_size_eta: The iteration control parameter η (from Eq. 38 and Table II).
-                         In the G-MGF algorithm, this is dynamically set, e.g., η = GDOP_k / GDOP_sup.
-                         A value of 1.0 corresponds to a standard MGF step.
-        """
-        # --- 1. State Prediction (as per Table II, Step 1) ---
-        # For a static sensor model, the predicted state is the previous state.
-        # The predicted covariance includes the addition of process noise.
+                     measured_distance: float, measurement_variance: float):
+        # --- 1. State Prediction ---
         x_prior = self.estimated_positions[sensor_id]
         P_prior = self.covariance_matrices[sensor_id] + self.process_noise_q
-
-        # Scalar measurement noise variance R
         R = measurement_variance
-        if R < 1e-9: R = 1e-9  # Avoid division by zero
+        if R < 1e-9: R = 1e-9
 
-        # --- 2. Calculate Components for Natural Gradient (Table II, Step 3) ---
-
-        # a. Measurement function h(x) and its Jacobian H = ∇x h(x)
+        # --- 2. Calculate Components ---
         diff_vec = x_prior - drone_position
         estimated_dist = np.linalg.norm(diff_vec)
         if estimated_dist < 1e-6:
-            return  # Avoid numerical instability if drone is on top of estimated position
-
-        # H is the Jacobian of the distance function w.r.t sensor position
-        H = (diff_vec / estimated_dist).reshape(1, 2)  # Shape (1, 2)
-
-        # b. Measurement residual (error) e_z = h(x) - z
-        # Paper uses h(x) - z; this sign convention is important for the gradient direction.
+            return
+        H = (diff_vec / estimated_dist).reshape(1, 2)
         e_z = estimated_dist - measured_distance
 
-        # c. State residual e_x = x - μ
-        # In this single-step filter formulation, the gradient is evaluated at the prior estimate (x=μ),
-        # so the state residual e_x = x_prior - x_prior = 0. The update is driven by measurement error.
+        # =================== 【核心修复：修正协方差更新】 ===================
+        # 我们不再直接计算 G 和 G_inv 来更新 P。
+        # 我们将采用更标准的、类似于EKF的更新流程，这在数值上更稳定。
 
-        # d. Euclidean Gradient ∇L (from Eq. 35)
-        # ∇L = H^T * R^-1 * e_z + P_prior^-1 * e_x. With e_x=0, it simplifies.
-        grad_L = H.T * (1 / R) * e_z  # Shape (2, 1)
+        # a. 计算卡尔曼增益 K 的等价形式
+        # S = H * P_prior * H^T + R
+        S = (H @ P_prior @ H.T) + R
+        if S < 1e-9: S = 1e-9
 
-        # e. Fisher Information Matrix (FIM) G(x) (from Eq. 36)
-        # G(x) = H^T * R^-1 * H + P_prior^-1
-        # This matrix represents the total precision (inverse of covariance) from both the
-        # measurement and the prior belief. It is the metric of the Riemannian manifold.
-        try:
-            P_prior_inv = np.linalg.inv(P_prior)
-        except np.linalg.LinAlgError:
-            P_prior_inv = np.linalg.pinv(P_prior)  # Use pseudo-inverse for stability
+        # K = P_prior * H^T * S^-1
+        K = (P_prior @ H.T) / S  # K 是一个 (2, 1) 的列向量
 
-        G = (H.T * (1 / R)) @ H + P_prior_inv  # Shape (2, 2)
+        # b. 更新状态估计 (标准的卡尔曼更新)
+        # x_post = x_prior + K * (真实测量 - 预测测量)
+        # 注意符号，我们的e_z = 预测 - 真实，所以这里用减号
+        x_post = x_prior - (K * e_z).flatten()
 
-        # --- 3. Perform the MGF Update ---
+        # c. 更新协方差矩阵 (使用 Joseph form，数值上最稳定)
+        # P_post = (I - K * H) * P_prior * (I - K * H)^T + K * R * K^T
+        # 一个更简洁的形式是 P_post = (I - K * H) * P_prior
+        I = np.eye(2)
+        P_post = (I - K @ H) @ P_prior
 
-        # a. Calculate the Natural Gradient T(x) = G(x)^-1 * ∇L (from Eq. 37)
-        # The inverse of the FIM, G_inv, reshapes the Euclidean gradient into the
-        # steepest descent direction on the curved information manifold.
-        try:
-            G_inv = np.linalg.inv(G)
-        except np.linalg.LinAlgError:
-            # If G is singular, the update is not well-defined. Skip this step.
-            return
-
-        natural_grad = G_inv @ grad_L  # Shape (2, 1)
-
-        # b. Update State Estimate using the Manifold Gradient (from Eq. 38)
-        # x_post = x_prior - η * T(x)
-        x_post = x_prior - step_size_eta * natural_grad.flatten()
-
-        # c. Update Covariance Matrix (from Table II, Σ_k+1 = G_k^-1)
-        # The posterior covariance is simply the inverse of the Fisher Information Matrix.
-        # This elegantly captures the new uncertainty after fusing the information.
-        P_post = G_inv
+        # =================================================================
 
         # --- 4. Save Updated State and Covariance ---
         self.estimated_positions[sensor_id] = x_post
@@ -264,7 +224,7 @@ if __name__ == "__main__":
         step_size_eta = 1.0
 
         # Perform the update
-        model.g_mgf_update(0, uav_pos, measured_dist, measurement_variance, step_size_eta)
+        model.g_mgf_update(0, uav_pos, measured_dist, measurement_variance)
 
         print(f"\n--- 更新 #{i + 1} (无人机位置: {uav_pos}) ---")
         print(f"估计位置: {model.estimated_positions[0]}")

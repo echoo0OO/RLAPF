@@ -1,73 +1,73 @@
+
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyArrowPatch
 
 
-class SpiralManeuverController:
+class InformationDrivenManeuverController:
     """
-    一个用于生成自适应螺旋定位机动轨迹的控制器。
+    一个基于信息增益，用于生成自适应定位机动轨迹的控制器。
 
-    该控制器计算单步的移动向量，使得无人机能够沿着一条从外向内收缩的
-    螺旋线飞行。在螺旋线外圈时，主要进行径向移动（快速靠近）；在内圈时，
-    主要进行切向移动（绕圈飞行），从而在保持总速度恒定的前提下，高效地
-    平衡“接近”和“获取几何多样性”两个目标。
+    该控制器通过分析历史测距点的角度分布，找到信息最稀疏的“空洞”区域，
+    并引导无人机飞向该区域进行测量，从而以最少的步骤最高效地改善几何构型(GDOP)。
     """
 
-    def __init__(self, total_speed: float, start_radius: float, min_radius: float, time_slot: float):
+    def __init__(self, total_speed: float, optimal_radius: float, time_slot: float, num_sectors: int = 12):
         """
-        初始化螺旋机动控制器。
+        初始化控制器。
 
         Args:
             total_speed (float): 无人机在机动过程中的总速度 (m/s)。
-            start_radius (float): 触发机动时，无人机距离目标的期望半径 (m)。
-            min_radius (float): 螺旋线结束的最小半径 (m)。当无人机进入此半径内，机动结束。
+            optimal_radius (float): 无人机期望保持的绕飞半径 (m)。
             time_slot (float): 环境的仿真步长 (s)。
+            num_sectors (int): 用于分析角度分布的扇区数量。
         """
         self.total_speed = total_speed
-        self.start_radius = start_radius
-        self.min_radius = min_radius
+        self.optimal_radius = optimal_radius
         self.time_slot = time_slot
+        self.num_sectors = num_sectors
 
-    def calculate_move_vector(self, drone_pos: np.ndarray, sensor_est_pos: np.ndarray) -> np.ndarray:
+    def _find_info_gap_direction(self, sensor_pos: np.ndarray, history_points: list) -> np.ndarray:
+        """找到信息量最少的方向（测距点最少的扇区）"""
+        if not history_points:
+            random_angle = np.random.uniform(0, 2 * np.pi)
+            return np.array([np.cos(random_angle), np.sin(random_angle)])
+
+        vectors = np.array(history_points) - sensor_pos
+        angles = np.arctan2(vectors[:, 1], vectors[:, 0])
+        sector_width = 2 * np.pi / self.num_sectors
+        sector_indices = np.floor((angles + np.pi) / sector_width).astype(int)
+        sector_indices = np.clip(sector_indices, 0, self.num_sectors - 1)
+        sector_counts = np.bincount(sector_indices, minlength=self.num_sectors)
+        min_count_sector_idx = np.argmin(sector_counts)
+        gap_angle = (min_count_sector_idx + 0.5) * sector_width - np.pi
+        return np.array([np.cos(gap_angle), np.sin(gap_angle)])
+
+    def calculate_move_vector(self, drone_pos: np.ndarray, sensor_est_pos: np.ndarray,
+                              history_points: list) -> np.ndarray:
         """
-        根据当前状态，计算下一步的移动向量。
-
-        Args:
-            drone_pos (np.ndarray): 无人机当前2D位置。
-            sensor_est_pos (np.ndarray): 目标传感器估计的2D位置（螺旋圆心）。
-
-        Returns:
-            np.ndarray: 无人机在下一个时间步应该移动的2D向量。
+        计算移动向量，其唯一目标是飞向信息空洞方向上的最优轨道点。
         """
-        # 1. 计算径向和切向的单位向量
-        vector_to_center = sensor_est_pos - drone_pos
-        dist_to_center = np.linalg.norm(vector_to_center)
+        dist_to_center = np.linalg.norm(sensor_est_pos - drone_pos)
 
-        # 如果已经非常接近，则悬停（返回零向量）
-        if dist_to_center < self.min_radius:
-            return np.array([0.0, 0.0])
+        # # 简单的退出条件
+        # if dist_to_center < self.optimal_radius * 0.5:  # 如果进入最优半径的一半以内，可以认为任务完成
+        #     # 这里的退出条件可以根据需求调整，比如用GDOP阈值
+        #     return np.array([0.0, 0.0])
 
-        norm_radial_vector = vector_to_center / (dist_to_center + 1e-6)
-        norm_tangent_vector = np.array([-norm_radial_vector[1], norm_radial_vector[0]])
+        # 1. 找到信息空洞的方向 (这部分逻辑不变)
+        gap_direction = self._find_info_gap_direction(sensor_est_pos, history_points)
 
-        # 2. 根据归一化距离动态计算权重
-        #    progress: 描述了从外圈到内圈的进度，从1 (最远) -> 0 (最近)
-        progress = (dist_to_center - self.min_radius) / (self.start_radius - self.min_radius)
-        #    将进度裁剪到[0, 1]区间，以处理无人机在起始半径之外或最小半径之内的情况
-        progress = np.clip(progress, 0, 1)
+        # 2. 确定唯一的目标点
+        target_point = sensor_est_pos + gap_direction * self.optimal_radius
 
-        #    当在远处时(progress ≈ 1), 径向权重高, 快速靠近
-        #    当在近处时(progress ≈ 0), 切向权重高, 快速绕圈
-        #weight_radial = progress
-        weight_radial = progress
-        weight_tangent = 1.0 - progress
+        # 3. 计算飞向该目标点的向量
+        vector_to_target = target_point - drone_pos
 
-        # 3. 合成最终的飞行方向向量并归一化
-        final_direction = (norm_radial_vector * weight_radial) + (norm_tangent_vector * weight_tangent)
-        norm_final_direction = final_direction / (np.linalg.norm(final_direction) + 1e-6)
-
-        # 4. 将总速度施加到最终方向上，得到移动向量
-        move_vector = norm_final_direction * self.total_speed * self.time_slot
+        # 4. 将总速度施加到这个方向上
+        norm_vector_to_target = vector_to_target / (np.linalg.norm(vector_to_target) + 1e-6)
+        move_vector = norm_vector_to_target * self.total_speed * self.time_slot
 
         return move_vector
 
@@ -76,105 +76,136 @@ class SpiralManeuverController:
 # 当此文件作为主脚本运行时，执行以下可视化和测试代码
 # ==============================================================================
 if __name__ == "__main__":
-
-    print("正在运行 `maneuver_controllers.py` 的独立可视化测试...")
+    print("Running standalone test for InformationDrivenManeuverController with GDOP plot...")
 
 
     # --- 辅助函数：模拟GDOP计算 ---
     def calculate_gdop(measurement_points, target_pos):
-        if len(measurement_points) < 2: return 99.0
+        # 至少需要2个点才能计算2D GDOP
+        if len(measurement_points) < 2: return 50.0  # 返回一个较大的默认值
+
         H = []
         for p in measurement_points:
             diff = p - target_pos
             dist = np.linalg.norm(diff)
             if dist < 1e-6: continue
             H.append(diff / dist)
+
         H = np.array(H)
-        if H.shape[0] < 2: return 99.0
+        if H.shape[0] < 2: return 50.0
+
         try:
-            H_T_H_inv = np.linalg.inv(H.T @ H)
+            # 计算几何矩阵 (H^T * H) 的逆
+            H_T_H = H.T @ H
+            # 检查矩阵是否奇异
+            if np.linalg.det(H_T_H) < 1e-9:
+                return 50.0
+
+            H_T_H_inv = np.linalg.inv(H_T_H)
+            # GDOP 是逆矩阵对角线元素之和的平方根
             return np.sqrt(np.trace(H_T_H_inv))
         except np.linalg.LinAlgError:
-            return 99.0
+            # 如果计算出错，返回一个较大的默认值
+            return 50.0
 
 
     # --- 场景和控制器参数设定 ---
     SIM_TOTAL_SPEED = 20.0
-    SIM_START_RADIUS = 100.0
-    SIM_MIN_RADIUS = 0.0
+    SIM_OPTIMAL_RADIUS = 40.0
     SIM_TIME_SLOT = 1.0
 
-    sensor_true_pos = np.array([505.0, 495.0])
     sensor_est_pos = np.array([500.0, 500.0])
 
     # --- 初始化控制器 ---
-    controller = SpiralManeuverController(
+    controller = InformationDrivenManeuverController(
         total_speed=SIM_TOTAL_SPEED,
-        start_radius=SIM_START_RADIUS,
-        min_radius=SIM_MIN_RADIUS,
-        time_slot=SIM_TIME_SLOT
+        optimal_radius=SIM_OPTIMAL_RADIUS,
+        time_slot=SIM_TIME_SLOT,
+        num_sectors=12
     )
 
-    # --- 模拟循环 ---
-    # 将无人机放置在起始半径处
-    drone_pos = sensor_est_pos + np.array([SIM_START_RADIUS, 0.0])
+    # --- 模拟设置 ---
+    initial_history_points = [
+        sensor_est_pos + np.array([50, 10]),
+        sensor_est_pos + np.array([60, -20]),
+        sensor_est_pos + np.array([40, -30]),
+    ]
+    drone_pos = sensor_est_pos + np.array([0.0, 120.0])
 
+    # 准备记录轨迹和GDOP历史
     trajectory = [drone_pos.copy()]
-    ranging_points = [drone_pos.copy()]
-    gdop_history = [calculate_gdop(ranging_points, sensor_est_pos)]
+    gdop_history = [calculate_gdop(initial_history_points, sensor_est_pos)]
 
-    max_steps = 5  # 防止无限循环
+    # --- 模拟循环 ---
+    max_steps = 100
+    print(f"Starting simulation for {max_steps} steps...")
     for step in range(max_steps):
-        # 核心：调用控制器计算下一步移动
-        move_vector = controller.calculate_move_vector(drone_pos, sensor_est_pos)
+        move_vector = controller.calculate_move_vector(drone_pos, sensor_est_pos, initial_history_points)
 
-        # 如果移动向量为零（表示已到达最小半径），则停止
         if np.linalg.norm(move_vector) < 1e-6:
-            print(f"机动在第 {step + 1} 步完成，已到达最小半径。")
+            print(f"Maneuver stopped at step {step + 1}.")
             break
 
-        # 更新状态
         drone_pos += move_vector
         trajectory.append(drone_pos.copy())
-        ranging_points.append(drone_pos.copy())
-        gdop_history.append(calculate_gdop(ranging_points, sensor_est_pos))
+        initial_history_points.append(drone_pos.copy())
 
-    # --- 绘图 ---
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
-    plt.rcParams['font.sans-serif'] = ['SimHei']
-    plt.rcParams['axes.unicode_minus'] = False
+        # 记录当前步的GDOP
+        gdop_history.append(calculate_gdop(initial_history_points, sensor_est_pos))
 
-    # 左图: 轨迹
-    ax1.set_title("自适应螺旋定位轨迹 (控制器测试)", fontsize=16)
-    ax1.plot(np.array(trajectory)[:, 0], np.array(trajectory)[:, 1], 'g-', lw=2, label='无人机飞行轨迹')
-    ax1.scatter(sensor_true_pos[0], sensor_true_pos[1], c='red', s=150, marker='*', zorder=5, label='传感器真实位置')
-    ax1.scatter(sensor_est_pos[0], sensor_est_pos[1], c='blue', s=100, marker='x', zorder=5,
-                label='传感器估计位置 (圆心)')
-    # 绘制起始点和结束点
-    ax1.scatter(trajectory[0][0], trajectory[0][1], c='lime', edgecolors='black', s=120, marker='o', zorder=5,
-                label='开始点')
-    ax1.scatter(trajectory[-1][0], trajectory[-1][1], c='orange', edgecolors='black', s=120, marker='s', zorder=5,
-                label='结束点')
+    print("Simulation finished.")
 
+    # --- 在循环结束后，绘制包含两个子图的最终结果 ---
+    print("Generating final plot...")
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 9))  # 创建1行2列的子图
+    fig.suptitle("Information-Driven Maneuver Analysis", fontsize=20)
+
+    # --- 左图: 轨迹图 ---
+    ax1.set_title(f"Final Trajectory ({len(trajectory) - 1} steps)", fontsize=16)
+    hist_pts_arr = np.array(initial_history_points)
+    ax1.scatter(hist_pts_arr[:, 0], hist_pts_arr[:, 1], c='gray', s=30, alpha=0.5, label='All History Points')
+    ax1.scatter(sensor_est_pos[0], sensor_est_pos[1], c='blue', s=100, marker='x', zorder=5, label='Sensor Est. Pos')
+    optimal_circle = plt.Circle(sensor_est_pos, SIM_OPTIMAL_RADIUS, color='blue', fill=False, linestyle='--', alpha=0.5,
+                                label='Optimal Radius')
+    ax1.add_patch(optimal_circle)
+    traj_arr = np.array(trajectory)
+    ax1.plot(traj_arr[:, 0], traj_arr[:, 1], 'g-', lw=2, label='UAV Trajectory')
+    ax1.scatter(traj_arr[0, 0], traj_arr[0, 1], c='cyan', edgecolors='black', s=150, marker='^', zorder=5,
+                label='Start Pos')
+    ax1.scatter(traj_arr[-1, 0], traj_arr[-1, 1], c='orange', edgecolors='black', s=150, marker='s', zorder=5,
+                label='End Pos')
+    final_gap_dir = controller._find_info_gap_direction(sensor_est_pos, initial_history_points)
+    arrow_start = sensor_est_pos
+    arrow_end = sensor_est_pos + final_gap_dir * (SIM_OPTIMAL_RADIUS + 20)
+    gap_arrow = FancyArrowPatch(arrow_start, arrow_end,
+                                arrowstyle='->', color='red', mutation_scale=20, lw=2, label='Final Info Gap Direction')
+    ax1.add_patch(gap_arrow)
     ax1.set_xlabel("X (m)")
     ax1.set_ylabel("Y (m)")
     ax1.legend()
     ax1.grid(True, linestyle='--', alpha=0.6)
     ax1.axis('equal')
+    ax1.set_xlim(sensor_est_pos[0] - 150, sensor_est_pos[0] + 150)
+    ax1.set_ylim(sensor_est_pos[1] - 150, sensor_est_pos[1] + 150)
 
-    # 右图: GDOP
-    ax2.set_title("GDOP随定位点增加而改善", fontsize=16)
-    steps_axis = np.arange(1, len(gdop_history) + 1)
-    bars = ax2.bar(steps_axis, gdop_history, color='mediumseagreen')
-    ax2.set_xlabel("定位点数量", fontsize=12)
-    ax2.set_ylabel("GDOP值", fontsize=12)
-    ax2.set_xticks(steps_axis)
-    ax2.set_ylim(0, max(gdop_history) * 1.1 if len(gdop_history) > 1 and max(gdop_history) < 90 else 10)
-    ax2.grid(axis='y', linestyle='--', alpha=0.7)
-    for bar in bars:
-        yval = bar.get_height()
-        if yval < 90:
-            ax2.text(bar.get_x() + bar.get_width() / 2.0, yval + 0.1, f'{yval:.2f}', ha='center', va='bottom')
+    # --- 右图: GDOP变化图 ---
+    ax2.set_title("GDOP vs. Number of Measurements", fontsize=16)
+    # X轴是测量点的数量 (从初始点数开始)
+    num_measurements = np.arange(len(initial_history_points) - len(trajectory) + 1, len(initial_history_points) + 1)
+    ax2.plot(num_measurements, gdop_history, 'r-o', lw=2, markersize=5, label='GDOP value')
+    ax2.set_xlabel("Number of Measurement Points")
+    ax2.set_ylabel("GDOP (Geometric Dilution of Precision)")
+    ax2.set_xticks(np.arange(min(num_measurements), max(num_measurements) + 1, 5))  # 每5个点一个刻度
+    ax2.grid(True, linestyle='--', alpha=0.7)
+    ax2.legend()
+    # 在关键点上标注数值
+    for i, gdop in enumerate(gdop_history):
+        if i == 0 or i == len(gdop_history) - 1 or (i + 1) % 10 == 0:  # 标注开始、结束和每10个点
+            ax2.text(num_measurements[i], gdop, f'{gdop:.2f}', ha='center', va='bottom')
 
-    plt.tight_layout()
+    # 调整布局防止重叠
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])  # 调整布局为总标题留出空间
+
+    # 显示最终的静态图
     plt.show()
+    print("Plot displayed.")

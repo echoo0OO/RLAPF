@@ -4,10 +4,10 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-
+from env.ekf_model import EKF_Model
 from env.env_utils import poisson_disk_sampling
 from env.uncertain_model import UncertaintyModel
-from env.maneuver_controllers import SpiralManeuverController
+from env.maneuver_controllers import InformationDrivenManeuverController
 
 class DroneNavigationEnv(gym.Env):
     """
@@ -61,7 +61,7 @@ class DroneNavigationEnv(gym.Env):
         self.snr_threshold_linear = 10 ** (self.snr_threshold / 10.0)
 
         # --- 定位模型 ---
-        self.uncertainty_model = UncertaintyModel(num_sensors=self.num_sensors)
+        self.uncertainty_model = EKF_Model(num_sensors=self.num_sensors)
 
         # --- 状态变量 ---
         self.drone_position = None
@@ -82,11 +82,14 @@ class DroneNavigationEnv(gym.Env):
         # 【新增】传感器级别的稳定状态标志
         self.is_sensor_stable = np.full(self.num_sensors, False, dtype=bool)
 
-        self.spiral_controller = SpiralManeuverController(
+        self.force_loc_count = np.zeros(self.num_sensors, dtype=int)
+        self.FORCE_LOC_TIMES_PER_SENSOR = 3  # <--- 在这里设置需要强制定位的次数
+
+        self.spiral_controller = InformationDrivenManeuverController(
             total_speed=20.0,
-            start_radius=150.0,  # 可调参数
-            min_radius=20.0,  # 可调参数
-            time_slot=self.time_slot
+            optimal_radius=40.0,
+            time_slot=self.time_slot,
+            num_sectors=12
         )
 
         # --- 新的双重稳定状态追踪 ---
@@ -176,21 +179,39 @@ class DroneNavigationEnv(gym.Env):
         【全新完整实现】计算当前步的高级动态动作掩码。
         """
         # --- 1. 离散动作掩码 ---
-        mask_discrete = np.ones((1, 2), dtype=np.int8)  # 默认都允许 [通信, 定位]
+        mask_discrete = np.ones((1, 2), dtype=np.int8)  # 默认 [通信, 定位] 都允许
+        mask_continuous = np.array([[-1.0, 1.0]] * 2)  # 默认连续动作范围
 
         # 检查所有需要收集数据的传感器
+        eligible_mask = self.sensor_data_amounts > 0
         unfinished_mask = self.sensor_data_amounts > 0
+        if not np.any(eligible_mask):
+            mask_discrete[0, :] = 0  # 所有任务完成，禁止所有离散动作
+            return mask_discrete, mask_continuous
 
-        # 如果没有任何需要收集数据的传感器，则禁止定位
-        if not np.any(unfinished_mask):
-            mask_discrete[0, 1] = 0
-        else:
-            # 获取所有未完成任务的传感器的硬稳定状态
-            hard_stable_status_of_unfinished = self.is_sensor_hard_stable[unfinished_mask]
+        distances = np.linalg.norm(self.drone_position - self.uncertainty_model.estimated_positions, axis=1)
+        distances[~eligible_mask] = np.inf
 
-            # **全局硬屏蔽逻辑**: 如果所有未完成的传感器都已达到硬稳定，则禁止“定位”
-            if np.all(hard_stable_status_of_unfinished):
-                mask_discrete[0, 1] = 0
+        if np.all(np.isinf(distances)):
+            return mask_discrete, mask_continuous
+
+        active_sensor_id = np.argmin(distances)
+
+        # 2. 【核心强制逻辑】
+        # 检查当前最近的这个传感器，是否还有强制定位任务没有完成
+        if self.force_loc_count[active_sensor_id] > 0:
+            # 如果计数器大于0，说明必须先定位
+            mask_discrete[0, 0] = 0  # 屏蔽动作0 (通信)
+            # 此时，智能体只能选择动作1 (定位)
+
+        # 3. （可选）如果所有传感器的强制定位都完成了，可以允许智能体自主选择是否要额外定位
+        #    这个逻辑由下面的硬稳定屏蔽来处理就足够了。
+
+        # 4. 保留原有的“硬稳定”屏蔽逻辑作为最终的安全保障
+        #    即，即使完成了强制定位，如果所有目标都硬稳定了，也不再允许智能体浪费时间去定位。
+        hard_stable_status_of_unfinished = self.is_sensor_hard_stable[eligible_mask]
+        if np.all(hard_stable_status_of_unfinished):
+            mask_discrete[0, 1] = 0  # 屏蔽动作1 (定位)
 
         # --- 2. 连续动作掩码 ---
         mask_continuous = np.array([[-1.0, 1.0], [-1.0, 1.0]], dtype=np.float32)  # 默认全范围
@@ -226,6 +247,9 @@ class DroneNavigationEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
+
+        # 【新增】重置时，为每个传感器设置好需要执行的强制定位次数
+        self.force_loc_count.fill(self.FORCE_LOC_TIMES_PER_SENSOR)
 
         # 重置所有稳定性相关的状态
         self.is_sensor_soft_stable.fill(False)
@@ -310,38 +334,35 @@ class DroneNavigationEnv(gym.Env):
         target_id = self.maneuver_target_sensor_id
         # =================== 补丁 2 开始 ===================
         # 检查目标ID是否有效，以及机动步数是否用尽
-        if target_id == -1 or self.maneuver_steps_left < 0:
+        if target_id == -1 :
             self.current_mode = 'DECIDING'
             return False
-
-        # 新的“软稳定”判断：即使目标稳定，也允许至少执行一步机动。
-        # 只有在第二次及以后进入时，才检查软稳定状态。
-        is_stable = self.is_sensor_soft_stable[target_id]
-        if is_stable and self.maneuver_steps_left < self.MANEUVER_TOTAL_STEPS - 1:
-            self.current_mode = 'DECIDING'
-            return False
-        # =================== 补丁 2 结束 ===================
-        # --- 1. 递减步数 ---
-        self.maneuver_steps_left -= 1
-        target_pos = self.uncertainty_model.estimated_positions[target_id]
-
-        # 调用螺旋控制器计算移动向量
-        move_vector = self.spiral_controller.calculate_move_vector(
-            self.drone_position, target_pos
-        )
-
-        # 如果控制器返回零向量（表示已完成），则切换模式
-        if np.linalg.norm(move_vector) < 1e-6:
-            self.current_mode = 'DECIDING'
-            return
-
-        # 更新无人机位置和速度
-        self.drone_position += move_vector
-        self.drone_velocity = move_vector / self.time_slot
-        self.drone_position = np.clip(self.drone_position, [0, 0], self.area_size)
-
-        self._execute_localization()
-        return True
+        # --- 在本地变量中模拟，不污染真实状态 ---
+        local_pos = self.drone_position.copy()
+        local_traj = []
+        executed_steps = 0
+        for _ in range(self.MANEUVER_TOTAL_STEPS):
+            # 机动逻辑现在只依赖于无人机和传感器的当前估计位置
+            sensor_est_pos = self.uncertainty_model.estimated_positions[target_id]
+            history_points = self.uncertainty_model.ranging_points[target_id] + local_traj  # 合并真实历史和本次机动轨迹
+            move_vector = self.spiral_controller.calculate_move_vector(
+                local_pos, sensor_est_pos, history_points
+            )
+            if np.linalg.norm(move_vector) < 1e-6: break
+            local_pos += move_vector
+            local_traj.append(local_pos.copy())
+            executed_steps += 1
+        # --- 模拟结束后，一次性应用所有更新 ---
+        if executed_steps > 0:
+            # 1. 依次处理模拟轨迹中的每一步，更新真实模型
+            for step_pos in local_traj:
+                self.drone_position = step_pos  # 临时设置真实位置以进行定位
+                self.trajectory.append(step_pos.copy())
+                self._execute_localization(step_override=self.current_step + 1)
+                self.current_step += 1
+            self.current_step -= 1  # 修正step函数开头多加的1
+        self.current_mode = 'DECIDING'
+        return executed_steps > 0
 
     def _execute_communication(self):
         """
@@ -407,19 +428,27 @@ class DroneNavigationEnv(gym.Env):
             'remaining_data': self.sensor_data_amounts.copy()
         })
 
-    def _execute_localization(self):
-        true_h_dists = np.linalg.norm(self.drone_position - self.sensor_true_positions, axis=1)
+    def _execute_localization(self, step_override=None):
+        current_drone_pos = self.drone_position
+        true_h_dists = np.linalg.norm(current_drone_pos - self.sensor_true_positions, axis=1)
         variances = self.uncertainty_model.g0 * (true_h_dists ** 2)
         std_devs = np.sqrt(variances)
         measured_dists = self.np_random.normal(loc=true_h_dists, scale=std_devs)
 
         for i in range(self.num_sensors):
-            self.uncertainty_model.g_mgf_update(
-                sensor_id=i,
-                drone_position=self.drone_position.copy(),
-                measured_distance=measured_dists[i],
-                measurement_variance=variances[i]
-            )
+            # 这样可以确保即使不更新，信息也被采集了
+            self.uncertainty_model.add_ranging_point(i, current_drone_pos.copy())
+            # 定义扇区覆盖度的阈值
+            COVERAGE_THRESHOLD = 4
+            # 获取当前传感器的扇区覆盖度
+            num_covered_sectors = self.uncertainty_model.get_sector_coverage(i, num_sectors=12)
+            if num_covered_sectors >= COVERAGE_THRESHOLD:
+                self.uncertainty_model.update(
+                    sensor_id=i,
+                    drone_position=current_drone_pos.copy(),
+                    measured_distance=measured_dists[i],
+                    measurement_variance=variances[i]
+                )
 
         changes = np.abs(self.radii_before_action - self.uncertainty_model.uncertainty_radii.copy())
         for i in range(self.num_sensors):
@@ -471,18 +500,20 @@ class DroneNavigationEnv(gym.Env):
         if self.current_mode == 'APPROACHING':
             self._execute_approach_policy()
 
-        elif self.current_mode == 'EXECUTING_MANEUVER':
-            self._execute_maneuver_policy()
+        # elif self.current_mode == 'EXECUTING_MANEUVER':
+        #     self._execute_maneuver_policy()
 
         elif self.current_mode == 'DECIDING':
             discrete_action = action["discrete"]
             real_direction, real_speed = self._unnormalize_action(action["continuous"])
 
-            self.drone_velocity = np.array([real_speed * np.cos(real_direction), real_speed * np.sin(real_direction)])
-            self.drone_position += self.drone_velocity * self.time_slot
-            self.drone_position = np.clip(self.drone_position, [0, 0], self.area_size)
+
 
             if discrete_action == 0:
+                self.drone_velocity = np.array(
+                    [real_speed * np.cos(real_direction), real_speed * np.sin(real_direction)])
+                self.drone_position += self.drone_velocity * self.time_slot
+                self.drone_position = np.clip(self.drone_position, [0, 0], self.area_size)
                 self._execute_communication()
             elif discrete_action == 1:
 
@@ -497,11 +528,7 @@ class DroneNavigationEnv(gym.Env):
                     self.maneuver_target_sensor_id = -1
 
                 # 2. 然后再切换模式并设置步数
-                self.current_mode = 'EXECUTING_MANEUVER'
-                self.maneuver_steps_left = self.MANEUVER_TOTAL_STEPS
-
                 maneuver_executed_successfully = self._execute_maneuver_policy()
-
                 eligible_mask = self.sensor_data_amounts > 0
                 if np.any(eligible_mask):
                     distances = np.linalg.norm(self.drone_position - self.uncertainty_model.estimated_positions, axis=1)
