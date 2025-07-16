@@ -34,7 +34,7 @@ def train():
 
     # 日志、绘图和保存的超参数
     log_interval = 1
-    plot_interval = 20
+    plot_interval = 100
     save_interval = 100
 
     # --- 2. 初始化环境和智能体 ---
@@ -50,7 +50,7 @@ def train():
     os.makedirs("./models", exist_ok=True)
 
     # --- 4. 训练循环 ---
-    max_train_episodes = 1001
+    max_train_episodes = 2001
     all_episode_rewards = []
 
     for episode in range(max_train_episodes):
