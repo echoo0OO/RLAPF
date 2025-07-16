@@ -39,7 +39,7 @@ class EKF_Model:
         # 过程噪声协方差矩阵 Q
         # 代表了我们对状态转移模型（x_k = x_{k-1}）的不确定性。
         # 对于静止传感器，这个值应该很小。
-        q_val = 1e-6  # 推荐使用一个非常小的值
+        q_val = 1e-4  # 推荐使用一个非常小的值
         self.process_noise_q = np.eye(2) * q_val
 
         # EKF需要用到的其他变量
